@@ -1,0 +1,29 @@
+{
+  "network_name": "SonataExtensionFixture",
+  "snncuda": {
+    "neuron_params": {
+      "default": {
+        "threshold": 1.0,
+        "window_size_ms": 20
+      }
+    },
+    "network": {
+      "name": "SonataFlat",
+      "populations": [
+        { "name": "input", "count": 2 },
+        { "name": "output", "count": 2 }
+      ],
+      "projections": [
+        {
+          "name": "input_to_output",
+          "source": "input",
+          "target": "output",
+          "pattern": "one_to_one",
+          "weight": 0.4,
+          "delay_ticks": 3
+        }
+      ]
+    }
+  }
+}
+

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<neuroml id="NeuroMLFixture">
+  <cell id="excitatory_cell">
+    <property tag="snnfw:threshold" value="0.9"/>
+    <property tag="snnfw:window_size_ms" value="30"/>
+    <property tag="snnfw:similarity_threshold" value="0.88"/>
+    <property tag="snnfw:max_reference_patterns" value="64"/>
+  </cell>
+  <network id="fixture_network">
+    <population id="pre" component="excitatory_cell" size="2"/>
+    <population id="post" component="excitatory_cell" size="2"/>
+    <projection id="pre_to_post"
+                presynapticPopulation="pre"
+                postsynapticPopulation="post"
+                synapse="exc"/>
+  </network>
+</neuroml>
+

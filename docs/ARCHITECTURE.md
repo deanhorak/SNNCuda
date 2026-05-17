@@ -1,0 +1,104 @@
+# Architecture Notes
+
+SNNCuda is intended to be a fresh C++ implementation of a spiking neural network runtime with optional CUDA acceleration.
+
+## Initial Boundaries
+
+- `snn`: neuron, synapse, population, and spike primitives
+- `runtime`: simulation timing, event scheduling, execution loops
+- `backends`: CPU and CUDA execution implementations
+- `config`: declarative configuration loading
+- `experiments`: reproducible benchmark and research harnesses
+- `diagnostics`: activity, separability, and performance measurement
+- `hierarchy`: brain-scale structural organization
+- `learning`: STDP and future learning rules
+- `storage`: persistent object and neuron-state storage
+
+## Principles
+
+- CPU behavior is the reference implementation.
+- CUDA paths must match CPU semantics before being optimized.
+- Experiment surfaces should be isolated from reusable runtime code.
+- Diagnostic visibility comes before complex learning or decision tuning.
+
+## CUDA Neuron Residency Model
+
+The intended runtime model is spike-triggered execution:
+
+1. A spike event identifies a target neuron.
+2. The runtime asks a resident neuron-state cache for the target state.
+3. If the state is resident, it is used directly.
+4. If the state is not resident, it is loaded from backing storage.
+5. If the resident cache is full, the least recently used neuron state is evicted and saved.
+6. The CUDA backend wakes work for the target neuron and applies the spike computation.
+
+The current `NeuronStateCache` is a CPU/reference abstraction for this policy. It is intentionally separate from CUDA kernels so eviction semantics can be tested before device memory management is optimized.
+
+## Spike Delivery Queue
+
+Spike delivery uses a circular timing wheel rather than a heap. Each simulation tick maps to a bucket by `delivery_tick % wheel_slots`, and each bucket stores the spike events for that temporal slot. Popping due spikes advances a monotonic cursor and drains all buckets up to the requested tick.
+
+This is the default because fixed-timestep SNN simulations schedule large numbers of near-future spikes. A timing wheel gives O(1) amortized insertion and avoids heap churn in dense traffic. The implementation still stores absolute delivery ticks inside each bucket, so events farther in the future than one wheel rotation are retained until their real tick arrives.
+
+The CUDA path should eventually translate each due bucket into target-neuron batches:
+
+- group due spikes by target neuron or resident-state page
+- load cold neuron state through the LRU residency layer
+- launch or enqueue device work for the active target set
+- preserve absolute tick ordering for STDP and temporal pattern windows
+
+## Propagation Plumbing
+
+`NetworkPropagator` is the current CPU/reference propagation path. It consumes a flattened
+`Connectome`, initializes neuron state from connectome neuron parameters, accepts external
+spike injections, processes due spikes through the timing wheel, and schedules downstream
+events through outgoing synapses whenever a neuron fires.
+
+This is intentionally small and deterministic. CUDA kernels should match this behavior before
+introducing batching, device-resident state pages, or parallel delivery optimizations.
+
+## Core Framework Direction
+
+The codebase now has compileable foundation types for:
+
+- brain hierarchy: `Brain -> Hemisphere -> Lobe -> Region -> Nucleus -> Column -> Layer -> Cluster -> Neuron`
+- canonical cortical columns with named `L1`, `L2/3`, `L4`, `L5`, and `L6` layer groups
+- spike events and retrograde events
+- STDP enable/disable and causal weight updates
+- temporal pattern matching
+- object storage and LRU state caching
+- parser registry and declarative loader interfaces
+
+The SNNFrame concepts are carried forward as boundaries and data models, not as experiment-specific code.
+
+## SNNFrame Lessons To Preserve
+
+- Keep declarative configuration as a first-class path.
+- Treat bilateral or multi-stage pipelines as measurable compositions.
+- Freeze learning during evaluation unless an experiment explicitly studies online adaptation.
+- Protect known baselines from speculative changes.
+
+## Deferred Implementation Choices
+
+- RocksDB is represented by a storage boundary, but the concrete RocksDB adapter is not wired until dependency policy is chosen.
+- Native JSON, SONATA, NeuroML, and HOC now normalize into `NetworkIR`, then flatten into `Connectome`.
+- SONATA support parses the JSON circuit config, SNNCuda/SNNFrame extension sections, and direct HDF5 node/edge files when HDF5 is available.
+- CUDA kernels should start by implementing CPU-equivalent neuron-state updates, then add batching and memory-residency optimization.
+
+## Declarative Loading And Connectome
+
+All supported formats target the same two-stage in-memory representation:
+
+1. `NetworkIR`: hierarchical, format-neutral network description with neuron parameter sets and projections.
+2. `Connectome`: flattened neuron and synapse lists plus population indexes for runtime delivery.
+
+Current parser coverage:
+
+- Native JSON: `.snnf.json` and `.snncuda.json`, including flat network configs, hierarchy configs, column templates, reusable neuron params, and projections.
+- SONATA: `circuit_config.json` and `.sonata.json`, reading `snncuda` or `snnframe` extension blocks from the JSON config plus HDF5 `/nodes/<population>/node_id`, `/nodes/<population>/node_type_id`, `/edges/<population>/source_node_id`, `/edges/<population>/target_node_id`, `/edges/<population>/weight`, and `/edges/<population>/delay`.
+- NeuroML: `.nml` and `.neuroml`, extracting cells, populations, and projections from common NeuroML v2 XML structure plus `snnfw:` properties.
+- HOC: `.hoc`, extracting template parameters, loop-instantiated populations, and `NetCon` projections for structural imports.
+
+The parser fixture battery is intentionally small but structural: each fixture must produce a valid
+tree-shaped `NetworkIR`, then a flattened connectome with expected populations, neuron counts,
+synapse counts, weights, delays, and source/target population mappings.

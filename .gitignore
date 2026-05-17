@@ -1,0 +1,47 @@
+# Build outputs
+build/
+build-*/
+cmake-build-*/
+out/
+bin/
+lib/
+
+# Compiled artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# CUDA
+*.cubin
+*.fatbin
+*.ptx
+*.nvprof
+
+# IDEs
+.idea/
+.vscode/
+*.user
+*.suo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Data and generated experiment artifacts
+data/
+artifacts/
+*.log
+*.snnr

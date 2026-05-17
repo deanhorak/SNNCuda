@@ -1,0 +1,24 @@
+{
+  "network_name": "SonataHdf5Fixture",
+  "manifest": {
+    "$BASE_DIR": ".",
+    "$NETWORK_DIR": "$BASE_DIR/networks"
+  },
+  "networks": {
+    "nodes": [
+      { "nodes_file": "$NETWORK_DIR/nodes.h5" }
+    ],
+    "edges": [
+      { "edges_file": "$NETWORK_DIR/edges.h5" }
+    ]
+  },
+  "snncuda": {
+    "neuron_params": {
+      "default": {
+        "threshold": 1.0,
+        "window_size_ms": 20
+      }
+    }
+  }
+}
+

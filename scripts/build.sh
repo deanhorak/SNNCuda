@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cmake -S . -B build -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
+cmake --build build -j
+
+if [[ -x /usr/bin/ctest ]]; then
+  /usr/bin/ctest --test-dir build --output-on-failure
+else
+  ctest --test-dir build --output-on-failure
+fi

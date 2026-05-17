@@ -1,0 +1,76 @@
+{
+  "snncuda": {
+    "neuron_params": {
+      "sensory": {
+        "threshold": 0.75,
+        "window_size_ms": 25,
+        "similarity_threshold": 0.91,
+        "max_reference_patterns": 32
+      },
+      "readout": {
+        "threshold": 1.25,
+        "window_size_ms": 50,
+        "similarity_threshold": 0.85,
+        "max_reference_patterns": 16
+      }
+    },
+    "simulation": {
+      "cuda_resident_neurons": 128,
+      "stdp_enabled": true
+    },
+    "brain": {
+      "name": "NativeBrain",
+      "hemispheres": [
+        {
+          "name": "Left Hemisphere",
+          "lobes": [
+            {
+              "name": "Occipital",
+              "regions": [
+                {
+                  "name": "V1",
+                  "nuclei": [
+                    {
+                      "name": "Stage1",
+                      "column_template": {
+                        "naming_pattern": "Orient_{orientation}_Freq_{frequency}",
+                        "orientations": [0, 90],
+                        "frequencies": [3],
+                        "layers": [
+                          {
+                            "name": "L4",
+                            "populations": [
+                              { "name": "sensory", "count": 2, "neuron_params": "sensory" }
+                            ]
+                          },
+                          {
+                            "name": "L5",
+                            "populations": [
+                              { "name": "readout", "count": 1, "neuron_params": "readout" }
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "projections": [
+      {
+        "name": "sensory_to_readout",
+        "source": "NativeBrain/Left Hemisphere/Occipital/V1/Stage1/*/L4/sensory",
+        "target": "NativeBrain/Left Hemisphere/Occipital/V1/Stage1/*/L5/readout",
+        "pattern": "all_to_all",
+        "weight": 0.6,
+        "max_weight": 1.5,
+        "delay_ticks": 2
+      }
+    ]
+  }
+}
+

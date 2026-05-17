@@ -1,0 +1,16 @@
+begintemplate CorticalCell
+  proc init() {
+    threshold = 0.8
+    window_size_ms = 35
+    similarity_threshold = 0.87
+  }
+  create soma, axon, dendrite
+endtemplate CorticalCell
+
+for i = 0, 1 { pre_cells.append(new CorticalCell()) }
+for i = 0, 1 { post_cells.append(new CorticalCell()) }
+
+for i = 0, 1 {
+  nc = new NetCon(pre_cells.o(i).soma(0.5), post_cells.o(i).syn, 0, 2, 0.7)
+}
+
