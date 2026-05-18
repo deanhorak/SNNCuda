@@ -12,6 +12,7 @@ add_library(snncuda
     runtime/SimulationClock.cpp
     runtime/NeuronStateCache.cpp
     runtime/SpikeScheduler.cpp
+    runtime/SynapseDendriteProcessor.cpp
     snn/Neuron.cpp
     snn/TemporalPattern.cpp
     backends/cpu/CpuBackend.cpp

@@ -2,6 +2,7 @@
 
 #include "snncuda/core/Ids.h"
 #include "snncuda/declarative/NetworkIR.h"
+#include "snncuda/snn/Synapse.h"
 
 #include <string>
 #include <unordered_map>
@@ -23,6 +24,9 @@ struct ConnectomeSynapse {
     float weight{1.0F};
     float max_weight{2.0F};
     std::uint32_t delay_ticks{1};
+    snn::DendriticCompartment compartment{snn::DendriticCompartment::Basal};
+    snn::ReceptorType receptor{snn::ReceptorType::Ampa};
+    bool plasticity_enabled{true};
 };
 
 struct Connectome {
@@ -37,4 +41,3 @@ public:
 };
 
 } // namespace snncuda::declarative
-

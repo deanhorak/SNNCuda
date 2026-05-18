@@ -29,6 +29,47 @@ snncuda_apply_common_options(snncuda_propagation_tests)
 
 add_test(NAME snncuda_propagation_tests COMMAND snncuda_propagation_tests)
 
+add_executable(snncuda_synapse_dendrite_tests
+    synapse_dendrite_tests.cpp
+)
+
+target_link_libraries(snncuda_synapse_dendrite_tests PRIVATE SNNCuda::snncuda)
+snncuda_apply_common_options(snncuda_synapse_dendrite_tests)
+
+add_test(NAME snncuda_synapse_dendrite_tests COMMAND snncuda_synapse_dendrite_tests)
+
+add_executable(snncuda_learning_temporal_experiment
+    learning_temporal_experiment.cpp
+)
+
+target_link_libraries(snncuda_learning_temporal_experiment PRIVATE SNNCuda::snncuda)
+snncuda_apply_common_options(snncuda_learning_temporal_experiment)
+
+add_test(NAME snncuda_learning_temporal_experiment COMMAND snncuda_learning_temporal_experiment)
+
+if(SNNCUDA_HAS_CUDA)
+    add_executable(snncuda_cuda_synapse_dendrite_tests
+        cuda_synapse_dendrite_tests.cpp
+    )
+
+    target_link_libraries(snncuda_cuda_synapse_dendrite_tests PRIVATE SNNCuda::snncuda)
+    snncuda_apply_common_options(snncuda_cuda_synapse_dendrite_tests)
+
+    add_test(NAME snncuda_cuda_synapse_dendrite_tests COMMAND snncuda_cuda_synapse_dendrite_tests)
+
+    add_executable(snncuda_cuda_learning_consistency_experiment
+        cuda_learning_consistency_experiment.cpp
+    )
+
+    target_link_libraries(snncuda_cuda_learning_consistency_experiment PRIVATE SNNCuda::snncuda)
+    snncuda_apply_common_options(snncuda_cuda_learning_consistency_experiment)
+
+    add_test(
+        NAME snncuda_cuda_learning_consistency_experiment
+        COMMAND snncuda_cuda_learning_consistency_experiment
+    )
+endif()
+
 add_executable(snncuda_spike_throughput
     spike_throughput_benchmark.cpp
 )

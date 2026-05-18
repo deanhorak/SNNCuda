@@ -393,6 +393,51 @@ private:
     return value != nullptr && value->is_bool() ? value->boolean() : fallback;
 }
 
+[[nodiscard]] std::string lowercase(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+[[nodiscard]] snn::DendriticCompartment parse_compartment(
+    const JsonValue* value,
+    snn::DendriticCompartment fallback) {
+    const auto text = lowercase(json_string(value));
+    if (text == "soma" || text == "somatic") {
+        return snn::DendriticCompartment::Soma;
+    }
+    if (text == "basal") {
+        return snn::DendriticCompartment::Basal;
+    }
+    if (text == "apical") {
+        return snn::DendriticCompartment::Apical;
+    }
+    if (text == "inhibitory" || text == "inhibition") {
+        return snn::DendriticCompartment::Inhibitory;
+    }
+    return fallback;
+}
+
+[[nodiscard]] snn::ReceptorType parse_receptor(
+    const JsonValue* value,
+    snn::ReceptorType fallback) {
+    const auto text = lowercase(json_string(value));
+    if (text == "ampa") {
+        return snn::ReceptorType::Ampa;
+    }
+    if (text == "nmda") {
+        return snn::ReceptorType::Nmda;
+    }
+    if (text == "gabaa" || text == "gaba_a" || text == "gaba-a") {
+        return snn::ReceptorType::GabaA;
+    }
+    if (text == "gabab" || text == "gaba_b" || text == "gaba-b") {
+        return snn::ReceptorType::GabaB;
+    }
+    return fallback;
+}
+
 [[nodiscard]] NeuronParamsIR parse_neuron_params(const JsonValue& value) {
     NeuronParamsIR params;
     params.threshold = json_float(value.find("threshold"), params.threshold);
@@ -582,6 +627,11 @@ void parse_neuron_param_map(const JsonValue* value, NetworkIR& ir) {
     projection.max_weight = json_float(value.find("max_weight"), projection.max_weight);
     projection.delay_ticks = static_cast<std::uint32_t>(
         json_u64(find_any(value, {"delay_ticks", "delay_ms", "delay"}), projection.delay_ticks));
+    projection.compartment = parse_compartment(value.find("compartment"), projection.compartment);
+    projection.receptor = parse_receptor(value.find("receptor"), projection.receptor);
+    projection.plasticity_enabled = json_bool(
+        find_any(value, {"plasticity_enabled", "stdp_enabled"}),
+        projection.plasticity_enabled);
     projection.scope = json_string(value.find("scope"), projection.scope);
     return projection;
 }

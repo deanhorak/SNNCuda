@@ -169,6 +169,42 @@ int main() {
                   << cuda_spikes_per_second << '\n';
         std::cout << "cuda_vs_cpu_speedup=" << std::fixed << std::setprecision(2)
                   << (cuda_spikes_per_second / spikes_per_second) << '\n';
+        std::cout << "cuda_debug_ticks_processed=" << cuda_result.debug.ticks_processed << '\n';
+        std::cout << "cuda_debug_scheduled_event_requests="
+                  << cuda_result.debug.scheduled_event_requests << '\n';
+        std::cout << "cuda_debug_scheduled_events=" << cuda_result.debug.scheduled_events << '\n';
+        std::cout << "cuda_debug_processed_events=" << cuda_result.debug.processed_events << '\n';
+        std::cout << "cuda_debug_dropped_events=" << cuda_result.debug.dropped_events << '\n';
+        std::cout << "cuda_debug_fired_appends=" << cuda_result.debug.fired_appends << '\n';
+        std::cout << "cuda_debug_fired_overflow=" << cuda_result.debug.fired_overflow << '\n';
+        std::cout << "cuda_debug_lock_spin_iterations="
+                  << cuda_result.debug.lock_spin_iterations << '\n';
+        std::cout << "cuda_debug_lock_timeouts=" << cuda_result.debug.lock_timeouts << '\n';
+        std::cout << "cuda_debug_stdp_updates=" << cuda_result.debug.stdp_updates << '\n';
+        std::cout << "cuda_debug_stdp_ltp=" << cuda_result.debug.stdp_ltp << '\n';
+        std::cout << "cuda_debug_stdp_ltd=" << cuda_result.debug.stdp_ltd << '\n';
+        std::cout << "cuda_debug_receptor_ampa_events="
+                  << cuda_result.debug.receptor_ampa_events << '\n';
+        std::cout << "cuda_debug_receptor_nmda_events="
+                  << cuda_result.debug.receptor_nmda_events << '\n';
+        std::cout << "cuda_debug_receptor_gaba_a_events="
+                  << cuda_result.debug.receptor_gaba_a_events << '\n';
+        std::cout << "cuda_debug_receptor_gaba_b_events="
+                  << cuda_result.debug.receptor_gaba_b_events << '\n';
+        std::cout << "cuda_debug_dendritic_integrations="
+                  << cuda_result.debug.dendritic_integrations << '\n';
+        std::cout << "cuda_debug_post_plasticity_scans="
+                  << cuda_result.debug.post_plasticity_scans << '\n';
+        std::cout << "cuda_debug_temporal_observations="
+                  << cuda_result.debug.temporal_observations << '\n';
+        std::cout << "cuda_debug_temporal_patterns_learned="
+                  << cuda_result.debug.temporal_patterns_learned << '\n';
+        std::cout << "cuda_debug_temporal_matches="
+                  << cuda_result.debug.temporal_matches << '\n';
+        std::cout << "cuda_debug_max_scheduled_events_per_tick="
+                  << cuda_result.debug.max_scheduled_events_per_tick << '\n';
+        std::cout << "cuda_debug_max_fired_neurons_per_tick="
+                  << cuda_result.debug.max_fired_neurons_per_tick << '\n';
         return delivered == cuda_result.delivered_spikes && fired == cuda_result.fired_spikes
             ? EXIT_SUCCESS
             : EXIT_FAILURE;

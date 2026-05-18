@@ -1,6 +1,7 @@
 #include "snncuda/declarative/Connectome.h"
 #include "snncuda/declarative/DeclarativeLoader.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -23,6 +24,12 @@ void require(bool condition, const char* message) {
     if (!condition) {
         throw std::runtime_error(message);
     }
+}
+
+std::filesystem::path make_temp_dir(const std::string& prefix) {
+    const auto suffix = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    return std::filesystem::temp_directory_path() / (prefix + "_" + suffix);
 }
 
 [[nodiscard]] const auto& first_layer(const NetworkIR& ir) {
@@ -166,7 +173,7 @@ void test_sonata_hdf5_fixture() {
         return;
     }
 
-    const auto root = std::filesystem::temp_directory_path() / "snncuda_committed_sonata_hdf5_fixture";
+    const auto root = make_temp_dir("snncuda_committed_sonata_hdf5_fixture");
     std::filesystem::remove_all(root);
     std::filesystem::create_directories(root);
     copy_fixture_file(fixture_dir() / "sonata_hdf5_circuit_config.json", root / "circuit_config.json");

@@ -10,11 +10,43 @@
 
 namespace snncuda::backends {
 
+struct CudaDebugMetrics {
+    std::uint64_t ticks_processed{0};
+    std::uint64_t scheduled_event_requests{0};
+    std::uint64_t scheduled_events{0};
+    std::uint64_t processed_events{0};
+    std::uint64_t dropped_events{0};
+    std::uint64_t fired_appends{0};
+    std::uint64_t fired_overflow{0};
+    std::uint64_t lock_spin_iterations{0};
+    std::uint64_t lock_timeouts{0};
+    std::uint64_t stdp_updates{0};
+    std::uint64_t stdp_ltp{0};
+    std::uint64_t stdp_ltd{0};
+    std::uint64_t receptor_ampa_events{0};
+    std::uint64_t receptor_nmda_events{0};
+    std::uint64_t receptor_gaba_a_events{0};
+    std::uint64_t receptor_gaba_b_events{0};
+    std::uint64_t dendritic_integrations{0};
+    std::uint64_t post_plasticity_scans{0};
+    std::uint64_t temporal_observations{0};
+    std::uint64_t temporal_patterns_learned{0};
+    std::uint64_t temporal_matches{0};
+    std::uint64_t max_scheduled_events_per_tick{0};
+    std::uint64_t max_fired_neurons_per_tick{0};
+};
+
 struct CudaPropagationResult {
     bool executed{false};
     std::uint64_t delivered_spikes{0};
     std::uint64_t fired_spikes{0};
     double elapsed_seconds{0.0};
+    CudaDebugMetrics debug;
+    std::vector<float> final_synapse_weights;
+    std::vector<float> final_membrane_potentials;
+    std::vector<std::uint64_t> final_neuron_spike_counts;
+    std::vector<std::uint64_t> final_temporal_match_counts;
+    std::vector<std::uint32_t> final_temporal_learned_pattern_counts;
 };
 
 class CudaBackend final : public Backend {

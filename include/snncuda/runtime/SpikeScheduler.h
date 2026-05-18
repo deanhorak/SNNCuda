@@ -1,6 +1,5 @@
 #pragma once
 
-#include "snncuda/runtime/NeuronStateCache.h"
 #include "snncuda/snn/SpikeEvent.h"
 
 #include <cstddef>
@@ -27,16 +26,6 @@ private:
     std::vector<Bucket> wheel_;
     std::uint64_t next_pop_tick_{0};
     std::size_t pending_count_{0};
-};
-
-class NeuronExecutionScheduler {
-public:
-    explicit NeuronExecutionScheduler(NeuronStateCache& cache);
-
-    [[nodiscard]] bool process_spike(const snn::SpikeEvent& event, std::uint64_t tick);
-
-private:
-    NeuronStateCache& cache_;
 };
 
 } // namespace snncuda::runtime

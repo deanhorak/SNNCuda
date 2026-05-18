@@ -31,6 +31,16 @@ The initial project structure keeps room for the ideas that proved useful in SNN
 
 The old implementation is not copied. Runtime, storage, network construction, CUDA kernels, and experiment harnesses are expected to be redesigned deliberately.
 
+## Learned Temporal Patterns
+
+SNNCuda treats spike timing as part of the signal, not just spike count. Each neuron carries a small temporal-pattern state alongside its membrane and dendritic compartment state. When a spike reaches the synapse/dendrite processing stage, the target neuron records the spike's offset from the start of its current temporal window. The window length, similarity threshold, and maximum learned patterns come from the neuron's declarative parameters.
+
+The first repeated-enough spike sequence in a window becomes a learned reference pattern. Later spike sequences are compared against the learned reference using cosine similarity over their offset vectors. If the similarity crosses the neuron's threshold, the neuron records a temporal match. This gives the runtime a direct way to distinguish different spike-time codes even when the same neurons participate.
+
+The CPU runtime stores this state in `NeuronState::temporal_pattern`. The CUDA resident runtime keeps a compact per-neuron version on device: observed offsets, one learned reference pattern, learned-pattern count, match count, and last-match state. The CUDA implementation currently uses a fixed offset capacity of 8 and one learned reference pattern per resident neuron. This is enough for the current experiments and provides a concrete baseline before expanding to multiple reference patterns per neuron.
+
+Temporal recognition is exercised by the learning consistency experiments. The CPU experiment verifies that repeated spike intervals are learned and later recognized. The CUDA consistency experiment runs the same learning and propagation path on the GPU and verifies that temporal match counts and learned-pattern counts agree with the CPU reference.
+
 ## Requirements
 
 - CMake 3.22 or newer

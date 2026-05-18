@@ -1,5 +1,7 @@
 #pragma once
 
+#include "snncuda/snn/Synapse.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -67,6 +69,9 @@ struct ProjectionIR {
     float weight{1.0F};
     float max_weight{2.0F};
     std::uint32_t delay_ticks{1};
+    snn::DendriticCompartment compartment{snn::DendriticCompartment::Basal};
+    snn::ReceptorType receptor{snn::ReceptorType::Ampa};
+    bool plasticity_enabled{true};
     std::string scope{"global"};
 };
 
@@ -78,6 +83,9 @@ struct ExplicitConnectionIR {
     float weight{1.0F};
     float max_weight{2.0F};
     std::uint32_t delay_ticks{1};
+    snn::DendriticCompartment compartment{snn::DendriticCompartment::Basal};
+    snn::ReceptorType receptor{snn::ReceptorType::Ampa};
+    bool plasticity_enabled{true};
 };
 
 struct SimulationIR {

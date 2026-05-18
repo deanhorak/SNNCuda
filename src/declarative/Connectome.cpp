@@ -127,6 +127,9 @@ Connectome ConnectomeBuilder::build(const NetworkIR& ir) const {
                     .weight = projection.weight,
                     .max_weight = projection.max_weight,
                     .delay_ticks = projection.delay_ticks,
+                    .compartment = projection.compartment,
+                    .receptor = projection.receptor,
+                    .plasticity_enabled = projection.plasticity_enabled,
                 });
             }
             continue;
@@ -138,12 +141,15 @@ Connectome ConnectomeBuilder::build(const NetworkIR& ir) const {
                     .id = next_synapse_id++,
                     .source = source,
                     .target = target,
-                    .weight = projection.weight,
-                    .max_weight = projection.max_weight,
-                    .delay_ticks = projection.delay_ticks,
-                });
-            }
+                .weight = projection.weight,
+                .max_weight = projection.max_weight,
+                .delay_ticks = projection.delay_ticks,
+                .compartment = projection.compartment,
+                .receptor = projection.receptor,
+                .plasticity_enabled = projection.plasticity_enabled,
+            });
         }
+    }
     }
 
     for (const auto& connection : ir.explicit_connections) {
@@ -160,6 +166,9 @@ Connectome ConnectomeBuilder::build(const NetworkIR& ir) const {
             .weight = connection.weight,
             .max_weight = connection.max_weight,
             .delay_ticks = connection.delay_ticks,
+            .compartment = connection.compartment,
+            .receptor = connection.receptor,
+            .plasticity_enabled = connection.plasticity_enabled,
         });
     }
 

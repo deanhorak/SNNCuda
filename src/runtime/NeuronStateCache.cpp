@@ -21,18 +21,23 @@ NeuronStateCache::NeuronStateCache(std::size_t resident_capacity, NeuronStateSto
 
 NeuronState NeuronStateCache::load_for_spike(core::NeuronId id) {
     if (auto resident = cache_.get(id)) {
+        ++load_hits_;
         return *resident;
     }
 
+    ++load_misses_;
     if (auto stored = backing_store_.load(id)) {
         return *stored;
     }
 
-    return NeuronState{.id = id};
+    NeuronState state;
+    state.id = id;
+    return state;
 }
 
 void NeuronStateCache::store_after_compute(NeuronState state) {
     if (auto evicted = cache_.put(state.id, state)) {
+        ++evictions_;
         backing_store_.save(evicted->second);
     }
 }
@@ -41,5 +46,16 @@ std::size_t NeuronStateCache::resident_count() const noexcept {
     return cache_.size();
 }
 
-} // namespace snncuda::runtime
+std::uint64_t NeuronStateCache::load_hit_count() const noexcept {
+    return load_hits_;
+}
 
+std::uint64_t NeuronStateCache::load_miss_count() const noexcept {
+    return load_misses_;
+}
+
+std::uint64_t NeuronStateCache::eviction_count() const noexcept {
+    return evictions_;
+}
+
+} // namespace snncuda::runtime

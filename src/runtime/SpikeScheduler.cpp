@@ -62,22 +62,4 @@ std::size_t SpikeScheduler::slot_for(std::uint64_t tick) const noexcept {
     return static_cast<std::size_t>(tick % wheel_.size());
 }
 
-NeuronExecutionScheduler::NeuronExecutionScheduler(NeuronStateCache& cache)
-    : cache_(cache) {
-}
-
-bool NeuronExecutionScheduler::process_spike(const snn::SpikeEvent& event, std::uint64_t tick) {
-    auto state = cache_.load_for_spike(event.target_neuron);
-    state.membrane_potential += event.weight;
-    state.last_active_tick = tick;
-    bool fired = false;
-    if (state.membrane_potential >= state.threshold) {
-        state.membrane_potential = 0.0F;
-        ++state.spike_count;
-        fired = true;
-    }
-    cache_.store_after_compute(state);
-    return fired;
-}
-
 } // namespace snncuda::runtime

@@ -3,6 +3,7 @@
 #include "snncuda/declarative/Connectome.h"
 #include "snncuda/runtime/NeuronStateCache.h"
 #include "snncuda/runtime/SpikeScheduler.h"
+#include "snncuda/runtime/SynapseDendriteProcessor.h"
 
 #include <cstdint>
 #include <unordered_map>
@@ -25,6 +26,9 @@ public:
     [[nodiscard]] std::uint64_t spike_count(core::NeuronId id);
     [[nodiscard]] std::uint64_t delivered_spike_count() const noexcept;
     [[nodiscard]] std::uint64_t fired_spike_count() const noexcept;
+    [[nodiscard]] std::uint64_t cache_eviction_count() const noexcept;
+    [[nodiscard]] std::size_t resident_neuron_count() const noexcept;
+    [[nodiscard]] const SynapseRuntimeState* synapse_state(core::SynapseId id) const;
     [[nodiscard]] bool idle() const noexcept;
 
 private:
@@ -34,8 +38,10 @@ private:
     NeuronStateStore& backing_store_;
     NeuronStateCache cache_;
     SpikeScheduler scheduler_;
-    NeuronExecutionScheduler executor_;
-    std::unordered_map<core::NeuronId, std::vector<const declarative::ConnectomeSynapse*>> outgoing_;
+    SynapseDendriteProcessor processor_;
+    std::unordered_map<core::SynapseId, SynapseRuntimeState> synapses_;
+    std::unordered_map<core::NeuronId, std::vector<core::SynapseId>> outgoing_;
+    std::unordered_map<core::NeuronId, std::vector<core::SynapseId>> incoming_;
     std::uint64_t delivered_spikes_{0};
     std::uint64_t fired_spikes_{0};
 };

@@ -3,17 +3,21 @@
 #include "snncuda/declarative/DeclarativeLoader.h"
 #include "snncuda/hierarchy/CorticalMicrocircuit.h"
 #include "snncuda/learning/STDP.h"
+#include "snncuda/runtime/NeuronStateCache.h"
 #include "snncuda/runtime/SimulationClock.h"
 #include "snncuda/runtime/SpikeScheduler.h"
+#include "snncuda/runtime/SynapseDendriteProcessor.h"
 #include "snncuda/snn/Neuron.h"
 #include "snncuda/snn/TemporalPattern.h"
 #include "snncuda/storage/LruCache.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 
 namespace {
 
@@ -24,13 +28,21 @@ void require(bool condition, const char* message) {
 }
 
 std::filesystem::path write_fixture(const std::string& name, const std::string& content) {
-    const auto path = std::filesystem::temp_directory_path() / name;
+    const auto suffix = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto path = std::filesystem::temp_directory_path() / (suffix + "_" + name);
     std::ofstream output(path);
     if (!output) {
         throw std::runtime_error("failed to write fixture");
     }
     output << content;
     return path;
+}
+
+std::filesystem::path make_temp_dir(const std::string& prefix) {
+    const auto suffix = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    return std::filesystem::temp_directory_path() / (prefix + "_" + suffix);
 }
 
 void test_clock() {
@@ -106,8 +118,15 @@ void test_neuron_state_cache() {
     snncuda::runtime::MemoryNeuronStateStore store;
     snncuda::runtime::NeuronStateCache cache{1, store};
 
-    cache.store_after_compute({.id = 1, .membrane_potential = 0.5F});
-    cache.store_after_compute({.id = 2, .membrane_potential = 0.25F});
+    snncuda::runtime::NeuronState first;
+    first.id = 1;
+    first.membrane_potential = 0.5F;
+    cache.store_after_compute(first);
+
+    snncuda::runtime::NeuronState second;
+    second.id = 2;
+    second.membrane_potential = 0.25F;
+    cache.store_after_compute(second);
 
     const auto restored = cache.load_for_spike(1);
     require(restored.id == 1, "evicted neuron should reload from backing store");
@@ -252,7 +271,7 @@ void test_sonata_hdf5_nodes_and_edges() {
         return;
     }
 
-    const auto root = std::filesystem::temp_directory_path() / "snncuda_sonata_hdf5_fixture";
+    const auto root = make_temp_dir("snncuda_sonata_hdf5_fixture");
     std::filesystem::remove_all(root);
     std::filesystem::create_directories(root / "networks");
 
@@ -350,11 +369,16 @@ void test_spike_scheduler() {
 
     snncuda::runtime::MemoryNeuronStateStore store;
     snncuda::runtime::NeuronStateCache cache{2, store};
-    snncuda::runtime::NeuronExecutionScheduler executor{cache};
+    snncuda::runtime::SynapseDendriteProcessor processor;
 
-    const auto fired = executor.process_spike({.target_neuron = 42, .delivery_tick = 1, .weight = 1.25F}, 1);
-    require(fired, "direct spike execution should report firing");
-    const auto state = cache.load_for_spike(42);
+    auto state = cache.load_for_spike(42);
+    const auto result = processor.process_external_input(
+        state,
+        {.target_neuron = 42, .delivery_tick = 1, .weight = 1.25F},
+        1);
+    cache.store_after_compute(state);
+    require(result.fired, "external spike processing should report firing");
+    state = cache.load_for_spike(42);
     require(state.spike_count == 1, "spike arrival should wake and update target neuron state");
 }
 
