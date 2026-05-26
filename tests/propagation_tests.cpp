@@ -89,6 +89,58 @@ snncuda::declarative::NetworkIR make_three_stage_ir() {
     return ir;
 }
 
+void test_synapse_spike_code_pattern_propagates_and_matches() {
+    auto ir = make_three_stage_ir();
+    ir.neuron_params["default"].threshold = 1.0F;
+    ir.neuron_params["sink"] = {
+        .threshold = 100.0F,
+        .pattern_window_ticks = 8,
+        .similarity_threshold = 0.99F,
+        .max_reference_patterns = 4,
+    };
+    auto& layer = ir.brain.hemispheres[0].lobes[0].regions[0].nuclei[0].columns[0].layers[0];
+    layer.populations.clear();
+    snncuda::declarative::PopulationIR source_population;
+    source_population.name = "source";
+    source_population.count = 1;
+    source_population.neuron_params = "default";
+    layer.populations.push_back(std::move(source_population));
+    snncuda::declarative::PopulationIR sink_population;
+    sink_population.name = "sink";
+    sink_population.count = 1;
+    sink_population.neuron_params = "sink";
+    layer.populations.push_back(std::move(sink_population));
+    ir.projections.clear();
+    ir.projections.push_back({
+        .name = "source_to_sink",
+        .source = "source",
+        .target = "sink",
+        .pattern = "one_to_one",
+        .weight = 0.1F,
+        .max_weight = 2.0F,
+        .delay_ticks = 1,
+        .spike_code_offsets = {0, 2},
+    });
+
+    const auto connectome = snncuda::declarative::ConnectomeBuilder{}.build(ir);
+    const auto source = connectome.populations.at("source").at(0);
+
+    snncuda::runtime::MemoryNeuronStateStore store;
+    snncuda::runtime::NetworkPropagator propagator(connectome, store, 2, 32);
+
+    propagator.inject(source, 0, 1.0F);
+    propagator.inject(source, 20, 1.0F);
+    propagator.run_until(25);
+
+    const auto* synapse = propagator.synapse_state(1);
+    require(synapse != nullptr, "coded synapse should exist");
+    require(synapse->spike_code_offsets.size() == 2, "synapse should preserve two-offset spike code");
+    require(synapse->pre_spike_count == 4, "two source firings should deliver two spikes per synapse each");
+    require(synapse->learned_code_patterns.size() >= 1, "synapse should learn incoming spike code");
+    require(synapse->code_match_count >= 1, "synapse should recognize repeated incoming spike code");
+    require(propagator.delivered_spike_count() == 6, "delivered count should include external and coded synaptic spikes");
+}
+
 void test_three_stage_spike_propagation() {
     const auto connectome = snncuda::declarative::ConnectomeBuilder{}.build(make_three_stage_ir());
     require(connectome.neurons.size() == 3, "test connectome should contain three neurons");
@@ -145,6 +197,7 @@ void test_subthreshold_spike_does_not_propagate() {
 int main() {
     try {
         test_three_stage_spike_propagation();
+        test_synapse_spike_code_pattern_propagates_and_matches();
         test_subthreshold_spike_does_not_propagate();
     } catch (const std::exception& error) {
         std::cerr << "Propagation test failed: " << error.what() << '\n';

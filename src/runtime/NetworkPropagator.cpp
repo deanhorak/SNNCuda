@@ -108,13 +108,25 @@ void NetworkPropagator::process_tick(std::uint64_t tick) {
 
         for (const auto synapse_id : found->second) {
             const auto& synapse = synapses_.at(synapse_id);
-            scheduler_.schedule({
-                .source_neuron = synapse.source,
-                .target_neuron = synapse.target,
-                .synapse = synapse.id,
-                .delivery_tick = tick + synapse.delay_ticks,
-                .weight = synapse.weight,
-            });
+            if (synapse.spike_code_offsets.empty()) {
+                scheduler_.schedule({
+                    .source_neuron = synapse.source,
+                    .target_neuron = synapse.target,
+                    .synapse = synapse.id,
+                    .delivery_tick = tick + synapse.delay_ticks,
+                    .weight = synapse.weight,
+                });
+                continue;
+            }
+            for (const auto offset : synapse.spike_code_offsets) {
+                scheduler_.schedule({
+                    .source_neuron = synapse.source,
+                    .target_neuron = synapse.target,
+                    .synapse = synapse.id,
+                    .delivery_tick = tick + synapse.delay_ticks + offset,
+                    .weight = synapse.weight,
+                });
+            }
         }
     }
 }

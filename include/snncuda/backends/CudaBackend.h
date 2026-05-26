@@ -47,6 +47,8 @@ struct CudaPropagationResult {
     std::vector<std::uint64_t> final_neuron_spike_counts;
     std::vector<std::uint64_t> final_temporal_match_counts;
     std::vector<std::uint32_t> final_temporal_learned_pattern_counts;
+    std::vector<std::uint64_t> final_synapse_code_match_counts;
+    std::vector<std::uint32_t> final_synapse_code_learned_pattern_counts;
 };
 
 class CudaBackend final : public Backend {

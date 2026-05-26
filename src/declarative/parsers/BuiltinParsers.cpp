@@ -393,6 +393,22 @@ private:
     return value != nullptr && value->is_bool() ? value->boolean() : fallback;
 }
 
+[[nodiscard]] std::vector<std::uint32_t> json_u32_array(
+    const JsonValue* value,
+    std::vector<std::uint32_t> fallback = {0}) {
+    if (value == nullptr || !value->is_array()) {
+        return fallback;
+    }
+
+    std::vector<std::uint32_t> values;
+    for (const auto& item : value->array()) {
+        if (item.is_number()) {
+            values.push_back(static_cast<std::uint32_t>(item.number()));
+        }
+    }
+    return values.empty() ? std::move(fallback) : values;
+}
+
 [[nodiscard]] std::string lowercase(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
@@ -627,6 +643,9 @@ void parse_neuron_param_map(const JsonValue* value, NetworkIR& ir) {
     projection.max_weight = json_float(value.find("max_weight"), projection.max_weight);
     projection.delay_ticks = static_cast<std::uint32_t>(
         json_u64(find_any(value, {"delay_ticks", "delay_ms", "delay"}), projection.delay_ticks));
+    projection.spike_code_offsets = json_u32_array(
+        find_any(value, {"spike_code_offsets", "spike_pattern_offsets", "spike_offsets"}),
+        projection.spike_code_offsets);
     projection.compartment = parse_compartment(value.find("compartment"), projection.compartment);
     projection.receptor = parse_receptor(value.find("receptor"), projection.receptor);
     projection.plasticity_enabled = json_bool(

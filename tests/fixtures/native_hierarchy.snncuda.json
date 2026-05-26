@@ -68,9 +68,9 @@
         "pattern": "all_to_all",
         "weight": 0.6,
         "max_weight": 1.5,
-        "delay_ticks": 2
+        "delay_ticks": 2,
+        "spike_code_offsets": [0, 2, 5]
       }
     ]
   }
 }
-

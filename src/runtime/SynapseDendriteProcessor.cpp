@@ -65,6 +65,9 @@ SynapseRuntimeState SynapseDendriteProcessor::initialize_synapse(
     state.weight = synapse.weight;
     state.max_weight = synapse.max_weight;
     state.delay_ticks = synapse.delay_ticks;
+    state.spike_code_offsets = synapse.spike_code_offsets.empty()
+        ? std::vector<std::uint32_t>{0}
+        : synapse.spike_code_offsets;
     state.compartment = synapse.compartment;
     state.receptor = synapse.receptor;
     state.plasticity_enabled = synapse.plasticity_enabled;
@@ -121,12 +124,14 @@ SynapseProcessingResult SynapseDendriteProcessor::process_synaptic_input(
 
     synapse.last_pre_spike_tick = pre_tick;
     ++synapse.pre_spike_count;
-    const auto result = process_input(
+    auto result = process_input(
         target,
         synapse.compartment,
         synapse.receptor,
         synapse.weight,
         tick);
+    update_synapse_code_pattern(synapse, target, tick);
+    result.pattern_matched = synapse.last_code_match;
     return result;
 }
 
@@ -308,6 +313,55 @@ void SynapseDendriteProcessor::update_temporal_pattern(
         return;
     }
     learn_pattern(target);
+}
+
+void SynapseDendriteProcessor::update_synapse_code_pattern(
+    SynapseRuntimeState& synapse,
+    const NeuronState& target,
+    std::uint64_t tick) const {
+    if (!config_.temporal_learning_enabled) {
+        synapse.last_code_match = false;
+        return;
+    }
+
+    if (synapse.code_offsets.empty()
+        || tick - synapse.code_window_start_tick > target.pattern_window_ticks) {
+        synapse.code_window_start_tick = tick;
+        synapse.code_offsets.clear();
+    }
+
+    synapse.code_offsets.push_back(static_cast<std::uint32_t>(tick - synapse.code_window_start_tick));
+    synapse.last_code_match = false;
+    const auto expected_count = std::max<std::size_t>(2, synapse.spike_code_offsets.size());
+    if (synapse.code_offsets.size() < expected_count) {
+        return;
+    }
+    if (synapse.code_offsets.size() > expected_count) {
+        synapse.code_offsets.erase(
+            synapse.code_offsets.begin(),
+            synapse.code_offsets.end() - static_cast<std::ptrdiff_t>(expected_count));
+    }
+
+    snn::TemporalPatternMatcher matcher({
+        .window_ticks = target.pattern_window_ticks,
+        .similarity_threshold = target.similarity_threshold,
+        .max_reference_patterns = target.max_reference_patterns,
+    });
+    for (const auto& pattern : synapse.learned_code_patterns) {
+        matcher.learn(pattern);
+    }
+
+    const auto current = make_pattern(synapse.code_offsets);
+    synapse.last_code_match = matcher.matches(current);
+    if (synapse.last_code_match) {
+        ++synapse.code_match_count;
+        return;
+    }
+
+    if (synapse.learned_code_patterns.size() >= target.max_reference_patterns) {
+        synapse.learned_code_patterns.erase(synapse.learned_code_patterns.begin());
+    }
+    synapse.learned_code_patterns.push_back(current);
 }
 
 } // namespace snncuda::runtime

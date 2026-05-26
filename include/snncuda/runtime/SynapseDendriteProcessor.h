@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace snncuda::runtime {
 
@@ -17,6 +18,7 @@ struct SynapseRuntimeState {
     float weight{1.0F};
     float max_weight{2.0F};
     std::uint32_t delay_ticks{1};
+    std::vector<std::uint32_t> spike_code_offsets{0};
     snn::DendriticCompartment compartment{snn::DendriticCompartment::Basal};
     snn::ReceptorType receptor{snn::ReceptorType::Ampa};
     bool plasticity_enabled{true};
@@ -25,6 +27,11 @@ struct SynapseRuntimeState {
     std::uint64_t pre_spike_count{0};
     std::uint64_t plasticity_update_count{0};
     float last_weight_delta{0.0F};
+    std::uint64_t code_window_start_tick{0};
+    std::vector<std::uint32_t> code_offsets;
+    std::vector<snn::TemporalPattern> learned_code_patterns;
+    std::uint64_t code_match_count{0};
+    bool last_code_match{false};
 };
 
 struct SynapseDendriteConfig {
@@ -79,6 +86,10 @@ private:
         snn::DendriticCompartment compartment) noexcept;
     [[nodiscard]] static float membrane_from_compartments(const NeuronState& target) noexcept;
     void update_temporal_pattern(NeuronState& target, std::uint64_t tick) const;
+    void update_synapse_code_pattern(
+        SynapseRuntimeState& synapse,
+        const NeuronState& target,
+        std::uint64_t tick) const;
 
     SynapseDendriteConfig config_;
     learning::StdpRule stdp_;

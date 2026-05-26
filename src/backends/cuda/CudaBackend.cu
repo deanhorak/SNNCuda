@@ -16,6 +16,7 @@ namespace {
 constexpr unsigned long long invalid_tick = std::numeric_limits<unsigned long long>::max();
 constexpr unsigned long long max_lock_spins = 10000000ULL;
 constexpr int temporal_capacity = 8;
+constexpr int spike_code_capacity = 8;
 
 enum CudaMetricIndex : int {
     metric_scheduled_event_requests = 0,
@@ -346,6 +347,86 @@ __device__ void device_update_temporal_pattern(
     learned_counts[neuron] = 1;
 }
 
+__device__ void device_update_synapse_code_pattern(
+    int edge,
+    unsigned long long tick,
+    unsigned int expected_count,
+    const unsigned long long* window_ticks,
+    const float* similarity_thresholds,
+    const unsigned int* max_patterns,
+    unsigned long long* window_start,
+    unsigned int* observed_offsets,
+    unsigned int* observed_counts,
+    unsigned int* reference_offsets,
+    unsigned int* reference_counts,
+    unsigned int* learned_counts,
+    unsigned long long* match_counts,
+    int* last_match,
+    unsigned long long* metrics) {
+    atomicAdd(&metrics[metric_temporal_observations], 1ULL);
+
+    expected_count = min(max(expected_count, 2U), static_cast<unsigned int>(temporal_capacity));
+    auto& start = window_start[edge];
+    auto& observed_count = observed_counts[edge];
+    if (observed_count == 0 || tick - start > window_ticks[edge]) {
+        start = tick;
+        observed_count = 0;
+    }
+
+    if (observed_count < temporal_capacity) {
+        observed_offsets[edge * temporal_capacity + observed_count] = static_cast<unsigned int>(tick - start);
+        ++observed_count;
+    } else {
+        for (int index = 1; index < temporal_capacity; ++index) {
+            observed_offsets[edge * temporal_capacity + index - 1] =
+                observed_offsets[edge * temporal_capacity + index];
+        }
+        observed_offsets[edge * temporal_capacity + temporal_capacity - 1] =
+            static_cast<unsigned int>(tick - start);
+        observed_count = temporal_capacity;
+    }
+
+    last_match[edge] = 0;
+    if (observed_count < expected_count) {
+        return;
+    }
+    if (observed_count > expected_count) {
+        const auto base = edge * temporal_capacity;
+        const auto remove_count = static_cast<int>(observed_count - expected_count);
+        for (int index = 0; index < static_cast<int>(expected_count); ++index) {
+            observed_offsets[base + index] = observed_offsets[base + index + remove_count];
+        }
+        observed_count = expected_count;
+    }
+
+    if (learned_counts[edge] > 0 && reference_counts[edge] == observed_count) {
+        const auto similarity = device_temporal_similarity(
+            edge,
+            observed_offsets,
+            reference_offsets,
+            static_cast<int>(observed_count));
+        if (similarity >= similarity_thresholds[edge]) {
+            last_match[edge] = 1;
+            ++match_counts[edge];
+            atomicAdd(&metrics[metric_temporal_matches], 1ULL);
+            return;
+        }
+    }
+
+    if (max_patterns[edge] == 0) {
+        return;
+    }
+    const auto base = edge * temporal_capacity;
+    for (int index = 0; index < static_cast<int>(observed_count); ++index) {
+        reference_offsets[base + index] = observed_offsets[base + index];
+    }
+    reference_counts[edge] = observed_count;
+    if (learned_counts[edge] == 0) {
+        atomicAdd(&metrics[metric_temporal_patterns_learned], 1ULL);
+    }
+    learned_counts[edge] = 1;
+}
+
 __global__ void initialize_initial_fired_kernel(
     const int* initial_fired,
     int initial_count,
@@ -383,6 +464,8 @@ __global__ void expand_fired_kernel(
     const int* outgoing_offsets,
     const int* outgoing_edges,
     const unsigned int* synapse_delays,
+    const unsigned int* synapse_code_offsets,
+    const unsigned int* synapse_code_counts,
     int* scheduled_edges,
     int* scheduled_counts,
     int event_capacity,
@@ -397,17 +480,21 @@ __global__ void expand_fired_kernel(
     const auto source = fired[index];
     for (auto edge = outgoing_offsets[source]; edge < outgoing_offsets[source + 1]; ++edge) {
         const auto synapse = outgoing_edges[edge];
-        atomicAdd(&metrics[metric_scheduled_event_requests], 1ULL);
-        const auto delivery_tick = tick + synapse_delays[synapse];
-        if (delivery_tick > max_tick) {
-            continue;
-        }
-        const auto count = atomicAdd(&scheduled_counts[delivery_tick], 1);
-        if (count < event_capacity) {
-            scheduled_edges[delivery_tick * event_capacity + count] = synapse;
-            atomicAdd(&metrics[metric_scheduled_events], 1ULL);
-        } else {
-            atomicAdd(&metrics[metric_dropped_events], 1ULL);
+        const auto code_count = max(1U, synapse_code_counts[synapse]);
+        for (unsigned int code = 0; code < code_count && code < spike_code_capacity; ++code) {
+            atomicAdd(&metrics[metric_scheduled_event_requests], 1ULL);
+            const auto offset = synapse_code_offsets[synapse * spike_code_capacity + code];
+            const auto delivery_tick = tick + synapse_delays[synapse] + offset;
+            if (delivery_tick > max_tick) {
+                continue;
+            }
+            const auto count = atomicAdd(&scheduled_counts[delivery_tick], 1);
+            if (count < event_capacity) {
+                scheduled_edges[delivery_tick * event_capacity + count] = synapse;
+                atomicAdd(&metrics[metric_scheduled_events], 1ULL);
+            } else {
+                atomicAdd(&metrics[metric_dropped_events], 1ULL);
+            }
         }
     }
 }
@@ -421,6 +508,7 @@ __global__ void process_synapse_events_kernel(
     unsigned long long tick,
     const int* edge_targets,
     const unsigned int* edge_delays,
+    const unsigned int* edge_code_counts,
     const int* edge_compartments,
     const int* edge_receptors,
     const int* edge_plasticity,
@@ -462,6 +550,17 @@ __global__ void process_synapse_events_kernel(
     unsigned int* temporal_learned_counts,
     unsigned long long* temporal_match_counts,
     int* temporal_last_match,
+    const unsigned long long* edge_code_window_ticks,
+    const float* edge_code_similarity_thresholds,
+    const unsigned int* edge_code_max_patterns,
+    unsigned long long* edge_code_window_start,
+    unsigned int* edge_code_observed_offsets,
+    unsigned int* edge_code_observed_counts,
+    unsigned int* edge_code_reference_offsets,
+    unsigned int* edge_code_reference_counts,
+    unsigned int* edge_code_learned_counts,
+    unsigned long long* edge_code_match_counts,
+    int* edge_code_last_match,
     unsigned long long* metrics) {
     const auto index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= event_count) {
@@ -567,6 +666,22 @@ __global__ void process_synapse_events_kernel(
         temporal_learned_counts,
         temporal_match_counts,
         temporal_last_match,
+        metrics);
+    device_update_synapse_code_pattern(
+        edge,
+        tick,
+        edge_code_counts[edge],
+        edge_code_window_ticks,
+        edge_code_similarity_thresholds,
+        edge_code_max_patterns,
+        edge_code_window_start,
+        edge_code_observed_offsets,
+        edge_code_observed_counts,
+        edge_code_reference_offsets,
+        edge_code_reference_counts,
+        edge_code_learned_counts,
+        edge_code_match_counts,
+        edge_code_last_match,
         metrics);
 
     membrane[target] = device_membrane(target, soma, basal, apical, inhibitory);
@@ -681,6 +796,11 @@ CudaPropagationResult CudaBackend::run_resident_propagation(
     std::vector<int> edge_compartments;
     std::vector<int> edge_receptors;
     std::vector<int> edge_plasticity;
+    std::vector<unsigned int> edge_code_offsets;
+    std::vector<unsigned int> edge_code_counts;
+    std::vector<unsigned long long> edge_code_window_ticks;
+    std::vector<float> edge_code_similarity_thresholds;
+    std::vector<unsigned int> edge_code_max_patterns;
     std::vector<float> edge_weights;
     std::vector<float> edge_max_weights;
     edge_sources.reserve(connectome.synapses.size());
@@ -689,6 +809,11 @@ CudaPropagationResult CudaBackend::run_resident_propagation(
     edge_compartments.reserve(connectome.synapses.size());
     edge_receptors.reserve(connectome.synapses.size());
     edge_plasticity.reserve(connectome.synapses.size());
+    edge_code_offsets.reserve(connectome.synapses.size() * spike_code_capacity);
+    edge_code_counts.reserve(connectome.synapses.size());
+    edge_code_window_ticks.reserve(connectome.synapses.size());
+    edge_code_similarity_thresholds.reserve(connectome.synapses.size());
+    edge_code_max_patterns.reserve(connectome.synapses.size());
     edge_weights.reserve(connectome.synapses.size());
     edge_max_weights.reserve(connectome.synapses.size());
 
@@ -702,11 +827,27 @@ CudaPropagationResult CudaBackend::run_resident_propagation(
         edge_sources.push_back(source->second);
         edge_targets.push_back(target->second);
         edge_delays.push_back(std::max(1U, synapse.delay_ticks));
+        const auto code_count = static_cast<unsigned int>(
+            std::min<std::size_t>(
+                synapse.spike_code_offsets.empty() ? 1 : synapse.spike_code_offsets.size(),
+                spike_code_capacity));
+        edge_code_counts.push_back(code_count);
+        for (int code = 0; code < spike_code_capacity; ++code) {
+            if (code < static_cast<int>(code_count) && !synapse.spike_code_offsets.empty()) {
+                edge_code_offsets.push_back(synapse.spike_code_offsets[static_cast<std::size_t>(code)]);
+            } else {
+                edge_code_offsets.push_back(0U);
+            }
+        }
         edge_compartments.push_back(static_cast<int>(synapse.compartment));
         edge_receptors.push_back(static_cast<int>(synapse.receptor));
         edge_plasticity.push_back(synapse.plasticity_enabled ? 1 : 0);
         edge_weights.push_back(synapse.weight);
         edge_max_weights.push_back(synapse.max_weight);
+        edge_code_window_ticks.push_back(temporal_window_ticks[static_cast<std::size_t>(target->second)]);
+        edge_code_similarity_thresholds.push_back(
+            temporal_similarity_thresholds[static_cast<std::size_t>(target->second)]);
+        edge_code_max_patterns.push_back(1U);
         outgoing[source->second].push_back(edge);
         incoming[target->second].push_back(edge);
     }
@@ -749,6 +890,11 @@ CudaPropagationResult CudaBackend::run_resident_propagation(
     auto* device_incoming_edges = copy_to_device(incoming_edges);
     auto* device_targets = copy_to_device(edge_targets);
     auto* device_delays = copy_to_device(edge_delays);
+    auto* device_code_offsets = copy_to_device(edge_code_offsets);
+    auto* device_code_counts = copy_to_device(edge_code_counts);
+    auto* device_edge_code_window_ticks = copy_to_device(edge_code_window_ticks);
+    auto* device_edge_code_similarity_thresholds = copy_to_device(edge_code_similarity_thresholds);
+    auto* device_edge_code_max_patterns = copy_to_device(edge_code_max_patterns);
     auto* device_compartments = copy_to_device(edge_compartments);
     auto* device_receptors = copy_to_device(edge_receptors);
     auto* device_plasticity = copy_to_device(edge_plasticity);
@@ -793,6 +939,14 @@ CudaPropagationResult CudaBackend::run_resident_propagation(
     unsigned int* device_temporal_learned_counts = nullptr;
     unsigned long long* device_temporal_match_counts = nullptr;
     int* device_temporal_last_match = nullptr;
+    unsigned long long* device_edge_code_window_start = nullptr;
+    unsigned int* device_edge_code_observed_offsets = nullptr;
+    unsigned int* device_edge_code_observed_counts = nullptr;
+    unsigned int* device_edge_code_reference_offsets = nullptr;
+    unsigned int* device_edge_code_reference_counts = nullptr;
+    unsigned int* device_edge_code_learned_counts = nullptr;
+    unsigned long long* device_edge_code_match_counts = nullptr;
+    int* device_edge_code_last_match = nullptr;
     unsigned long long* device_metrics = nullptr;
 
     const auto neuron_count = connectome.neurons.size();
@@ -823,6 +977,9 @@ CudaPropagationResult CudaBackend::run_resident_propagation(
     std::vector<int> zero_neuron_i32(neuron_count, 0);
     std::vector<unsigned long long> invalid_edge_ticks(edge_count, invalid_tick);
     std::vector<unsigned long long> zero_edge_counts(edge_count, 0);
+    std::vector<unsigned int> zero_edge_u32(edge_count, 0);
+    std::vector<int> zero_edge_i32(edge_count, 0);
+    std::vector<unsigned int> zero_edge_temporal_offsets(edge_count * temporal_capacity, 0);
     std::vector<float> zero_edge_deltas(edge_count, 0.0F);
 
     device_soma_tau = copy_to_device(soma_tau);
@@ -843,6 +1000,14 @@ CudaPropagationResult CudaBackend::run_resident_propagation(
     device_temporal_learned_counts = copy_to_device(zero_neuron_u32);
     device_temporal_match_counts = copy_to_device(zero_neuron_counts);
     device_temporal_last_match = copy_to_device(zero_neuron_i32);
+    device_edge_code_window_start = copy_to_device(zero_edge_counts);
+    device_edge_code_observed_offsets = copy_to_device(zero_edge_temporal_offsets);
+    device_edge_code_observed_counts = copy_to_device(zero_edge_u32);
+    device_edge_code_reference_offsets = copy_to_device(zero_edge_temporal_offsets);
+    device_edge_code_reference_counts = copy_to_device(zero_edge_u32);
+    device_edge_code_learned_counts = copy_to_device(zero_edge_u32);
+    device_edge_code_match_counts = copy_to_device(zero_edge_counts);
+    device_edge_code_last_match = copy_to_device(zero_edge_i32);
     device_last_pre_ticks = copy_to_device(invalid_edge_ticks);
     device_last_post_ticks = copy_to_device(invalid_edge_ticks);
     device_pre_counts = copy_to_device(zero_edge_counts);
@@ -938,6 +1103,7 @@ CudaPropagationResult CudaBackend::run_resident_propagation(
                 tick,
                 device_targets,
                 device_delays,
+                device_code_counts,
                 device_compartments,
                 device_receptors,
                 device_plasticity,
@@ -979,6 +1145,17 @@ CudaPropagationResult CudaBackend::run_resident_propagation(
                 device_temporal_learned_counts,
                 device_temporal_match_counts,
                 device_temporal_last_match,
+                device_edge_code_window_ticks,
+                device_edge_code_similarity_thresholds,
+                device_edge_code_max_patterns,
+                device_edge_code_window_start,
+                device_edge_code_observed_offsets,
+                device_edge_code_observed_counts,
+                device_edge_code_reference_offsets,
+                device_edge_code_reference_counts,
+                device_edge_code_learned_counts,
+                device_edge_code_match_counts,
+                device_edge_code_last_match,
                 device_metrics);
             check_cuda(cudaGetLastError(), "process_synapse_events_kernel launch");
             check_cuda(cudaDeviceSynchronize(), "process_synapse_events_kernel synchronize");
@@ -1002,6 +1179,8 @@ CudaPropagationResult CudaBackend::run_resident_propagation(
                 device_offsets,
                 device_outgoing_edges,
                 device_delays,
+                device_code_offsets,
+                device_code_counts,
                 device_scheduled_edges,
                 device_scheduled_counts,
                 static_cast<int>(event_capacity),
@@ -1066,6 +1245,31 @@ CudaPropagationResult CudaBackend::run_resident_propagation(
             final_temporal_learned.size() * sizeof(unsigned int),
             cudaMemcpyDeviceToHost),
         "cudaMemcpy final temporal learned counts");
+    std::vector<unsigned long long> final_synapse_code_matches_raw(edge_count, 0);
+    if (edge_count > 0) {
+        check_cuda(
+            cudaMemcpy(
+                final_synapse_code_matches_raw.data(),
+                device_edge_code_match_counts,
+                final_synapse_code_matches_raw.size() * sizeof(unsigned long long),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy final synapse code match counts");
+    }
+    std::vector<std::uint64_t> final_synapse_code_matches;
+    final_synapse_code_matches.reserve(final_synapse_code_matches_raw.size());
+    for (const auto value : final_synapse_code_matches_raw) {
+        final_synapse_code_matches.push_back(static_cast<std::uint64_t>(value));
+    }
+    std::vector<unsigned int> final_synapse_code_learned(edge_count, 0);
+    if (edge_count > 0) {
+        check_cuda(
+            cudaMemcpy(
+                final_synapse_code_learned.data(),
+                device_edge_code_learned_counts,
+                final_synapse_code_learned.size() * sizeof(unsigned int),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy final synapse code learned counts");
+    }
 
     std::vector<unsigned long long> raw_metrics(metric_count, 0);
     check_cuda(
@@ -1102,6 +1306,11 @@ CudaPropagationResult CudaBackend::run_resident_propagation(
     cudaFree(device_incoming_edges);
     cudaFree(device_targets);
     cudaFree(device_delays);
+    cudaFree(device_code_offsets);
+    cudaFree(device_code_counts);
+    cudaFree(device_edge_code_window_ticks);
+    cudaFree(device_edge_code_similarity_thresholds);
+    cudaFree(device_edge_code_max_patterns);
     cudaFree(device_compartments);
     cudaFree(device_receptors);
     cudaFree(device_plasticity);
@@ -1134,6 +1343,14 @@ CudaPropagationResult CudaBackend::run_resident_propagation(
     cudaFree(device_temporal_learned_counts);
     cudaFree(device_temporal_match_counts);
     cudaFree(device_temporal_last_match);
+    cudaFree(device_edge_code_window_start);
+    cudaFree(device_edge_code_observed_offsets);
+    cudaFree(device_edge_code_observed_counts);
+    cudaFree(device_edge_code_reference_offsets);
+    cudaFree(device_edge_code_reference_counts);
+    cudaFree(device_edge_code_learned_counts);
+    cudaFree(device_edge_code_match_counts);
+    cudaFree(device_edge_code_last_match);
     cudaFree(device_last_pre_ticks);
     cudaFree(device_last_post_ticks);
     cudaFree(device_pre_counts);
@@ -1158,6 +1375,8 @@ CudaPropagationResult CudaBackend::run_resident_propagation(
         .final_neuron_spike_counts = std::move(final_spikes),
         .final_temporal_match_counts = std::move(final_temporal_matches),
         .final_temporal_learned_pattern_counts = std::move(final_temporal_learned),
+        .final_synapse_code_match_counts = std::move(final_synapse_code_matches),
+        .final_synapse_code_learned_pattern_counts = std::move(final_synapse_code_learned),
     };
 }
 

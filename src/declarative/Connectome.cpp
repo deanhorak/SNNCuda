@@ -127,6 +127,9 @@ Connectome ConnectomeBuilder::build(const NetworkIR& ir) const {
                     .weight = projection.weight,
                     .max_weight = projection.max_weight,
                     .delay_ticks = projection.delay_ticks,
+                    .spike_code_offsets = projection.spike_code_offsets.empty()
+                        ? std::vector<std::uint32_t>{0}
+                        : projection.spike_code_offsets,
                     .compartment = projection.compartment,
                     .receptor = projection.receptor,
                     .plasticity_enabled = projection.plasticity_enabled,
@@ -144,6 +147,9 @@ Connectome ConnectomeBuilder::build(const NetworkIR& ir) const {
                 .weight = projection.weight,
                 .max_weight = projection.max_weight,
                 .delay_ticks = projection.delay_ticks,
+                .spike_code_offsets = projection.spike_code_offsets.empty()
+                    ? std::vector<std::uint32_t>{0}
+                    : projection.spike_code_offsets,
                 .compartment = projection.compartment,
                 .receptor = projection.receptor,
                 .plasticity_enabled = projection.plasticity_enabled,
@@ -166,6 +172,9 @@ Connectome ConnectomeBuilder::build(const NetworkIR& ir) const {
             .weight = connection.weight,
             .max_weight = connection.max_weight,
             .delay_ticks = connection.delay_ticks,
+            .spike_code_offsets = connection.spike_code_offsets.empty()
+                ? std::vector<std::uint32_t>{0}
+                : connection.spike_code_offsets,
             .compartment = connection.compartment,
             .receptor = connection.receptor,
             .plasticity_enabled = connection.plasticity_enabled,

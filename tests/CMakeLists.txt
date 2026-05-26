@@ -76,3 +76,17 @@ add_executable(snncuda_spike_throughput
 
 target_link_libraries(snncuda_spike_throughput PRIVATE SNNCuda::snncuda)
 snncuda_apply_common_options(snncuda_spike_throughput)
+
+add_executable(snncuda_spike_code_accuracy
+    spike_code_accuracy_benchmark.cpp
+)
+
+target_link_libraries(snncuda_spike_code_accuracy PRIVATE SNNCuda::snncuda)
+snncuda_apply_common_options(snncuda_spike_code_accuracy)
+
+add_executable(snncuda_network_learning_accuracy
+    network_learning_accuracy_experiment.cpp
+)
+
+target_link_libraries(snncuda_network_learning_accuracy PRIVATE SNNCuda::snncuda)
+snncuda_apply_common_options(snncuda_network_learning_accuracy)

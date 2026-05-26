@@ -196,6 +196,45 @@ void test_cuda_ltd_matches_cpu_direction() {
     require(cpu.synapse_state(2)->weight < 0.5F, "CPU pre-after-post STDP should depress");
 }
 
+void test_cuda_coded_synapse_expansion_matches_cpu() {
+    auto ir = make_ltp_ir();
+    ir.neuron_params["target"].threshold = 100.0F;
+    ir.neuron_params["target"].pattern_window_ticks = 8;
+    ir.neuron_params["target"].similarity_threshold = 0.99F;
+    ir.neuron_params["target"].max_reference_patterns = 4;
+    ir.projections[0].weight = 0.1F;
+    ir.projections[0].spike_code_offsets = {0, 2, 3};
+    ir.projections.push_back({
+        .name = "input_retrigger",
+        .source = "input",
+        .target = "input",
+        .pattern = "one_to_one",
+        .weight = 1.0F,
+        .max_weight = 2.0F,
+        .delay_ticks = 20,
+        .plasticity_enabled = false,
+    });
+    const auto connectome = snncuda::declarative::ConnectomeBuilder{}.build(ir);
+    const auto input = connectome.populations.at("input").at(0);
+
+    snncuda::runtime::MemoryNeuronStateStore store;
+    snncuda::runtime::NetworkPropagator cpu(connectome, store, 8, 16);
+    run_cpu({input}, 25, cpu);
+
+    const snncuda::backends::CudaBackend cuda;
+    const auto gpu = cuda.run_resident_propagation(connectome, {input}, 25);
+
+    require(gpu.executed, "CUDA coded synapse test should execute");
+    require(cpu.delivered_spike_count() == 8, "CPU should process external plus repeated coded synaptic spikes");
+    require(gpu.delivered_spikes == cpu.delivered_spike_count(), "CUDA coded synapse delivered count should match CPU");
+    require(gpu.fired_spikes == cpu.fired_spike_count(), "CUDA coded synapse fired count should match CPU");
+    require(gpu.debug.scheduled_event_requests == 8, "CUDA should request every emitted code spike and retrigger spike");
+    require(gpu.debug.scheduled_events == 7, "CUDA should schedule in-window emitted code spikes and retrigger spike");
+    require(cpu.synapse_state(1)->code_match_count >= 1, "CPU synapse should recognize repeated spike code");
+    require(gpu.final_synapse_code_match_counts.size() == 2, "CUDA should return synapse code match counts");
+    require(gpu.final_synapse_code_match_counts[0] >= 1, "CUDA synapse should recognize repeated spike code");
+}
+
 } // namespace
 
 int main() {
@@ -210,6 +249,7 @@ int main() {
         test_cuda_ltp_matches_cpu_counts_and_potentiates();
         test_cuda_inhibitory_receptor_matches_cpu_nonfire();
         test_cuda_ltd_matches_cpu_direction();
+        test_cuda_coded_synapse_expansion_matches_cpu();
     } catch (const std::exception& error) {
         std::cerr << "CUDA synapse/dendrite test failed: " << error.what() << '\n';
         return EXIT_FAILURE;

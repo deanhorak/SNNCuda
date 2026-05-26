@@ -8,6 +8,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -93,6 +94,8 @@ void test_native_hierarchy_fixture() {
     require(connectome.synapses.size() == 8, "native wildcard projection should connect all sources/targets");
     require(connectome.synapses.front().weight == 0.6F, "native projection weight should be preserved");
     require(connectome.synapses.front().delay_ticks == 2, "native projection delay should be preserved");
+    require(connectome.synapses.front().spike_code_offsets == std::vector<std::uint32_t>({0, 2, 5}),
+        "native projection spike code should be preserved");
     require(has_population_path_suffix(connectome, "Orient_0_Freq_3/L4/sensory"),
         "native connectome should retain abstract population path");
     require(has_population_path_suffix(connectome, "Orient_90_Freq_3/L5/readout"),
