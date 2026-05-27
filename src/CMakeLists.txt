@@ -1,4 +1,5 @@
 add_library(snncuda
+    c/SNNCudaC.cpp
     core/Version.cpp
     declarative/Connectome.cpp
     declarative/DeclarativeLoader.cpp

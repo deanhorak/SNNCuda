@@ -1,0 +1,22 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+set(SNNCUDA_HAS_CUDA @SNNCUDA_HAS_CUDA@)
+set(SNNCUDA_HAS_HDF5 @SNNCUDA_HAS_HDF5@)
+
+if(SNNCUDA_HAS_CUDA)
+    find_dependency(CUDAToolkit)
+endif()
+
+if(SNNCUDA_HAS_HDF5)
+    find_dependency(PkgConfig)
+    pkg_check_modules(HDF5_PC QUIET hdf5)
+    if(NOT HDF5_PC_FOUND)
+        find_dependency(HDF5 COMPONENTS C)
+    endif()
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/SNNCudaTargets.cmake")
+
+check_required_components(SNNCuda)

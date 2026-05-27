@@ -5,6 +5,8 @@ project(SNNCuda
     DESCRIPTION "A modern C++ spiking neural network framework with optional CUDA acceleration"
     LANGUAGES CXX)
 
+include(CMakePackageConfigHelpers)
+
 option(SNNCUDA_BUILD_EXAMPLES "Build example programs" ON)
 option(SNNCUDA_BUILD_TESTS "Build tests" ON)
 option(SNNCUDA_ENABLE_CUDA "Enable CUDA acceleration when a CUDA toolkit is available" ON)
@@ -76,4 +78,29 @@ endif()
 install(
     DIRECTORY include/
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+)
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/SNNCudaConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/SNNCudaConfig.cmake"
+    INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/SNNCuda"
+)
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/SNNCudaConfigVersion.cmake"
+    VERSION "${PROJECT_VERSION}"
+    COMPATIBILITY SameMajorVersion
+)
+
+install(
+    EXPORT SNNCudaTargets
+    NAMESPACE SNNCuda::
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/SNNCuda"
+)
+
+install(
+    FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/SNNCudaConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/SNNCudaConfigVersion.cmake"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/SNNCuda"
 )

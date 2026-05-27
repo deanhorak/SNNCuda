@@ -1,6 +1,9 @@
 # Architecture Notes
 
-SNNCuda is intended to be a fresh C++ implementation of a spiking neural network runtime with optional CUDA acceleration.
+SNNCuda is a fresh C++ implementation of a spiking neural network runtime with
+optional CUDA acceleration. It is now structured as a reusable library, with
+experiments and benchmarks kept in `tests/` so downstream applications can link
+the runtime without inheriting project-specific workflows.
 
 ## Initial Boundaries
 
@@ -8,7 +11,7 @@ SNNCuda is intended to be a fresh C++ implementation of a spiking neural network
 - `runtime`: simulation timing, event scheduling, execution loops
 - `backends`: CPU and CUDA execution implementations
 - `config`: declarative configuration loading
-- `experiments`: reproducible benchmark and research harnesses
+- `tests`: reproducible validation, benchmark, and research harnesses
 - `diagnostics`: activity, separability, and performance measurement
 - `hierarchy`: brain-scale structural organization
 - `learning`: STDP and future learning rules
@@ -32,7 +35,11 @@ The intended runtime model is spike-triggered execution:
 5. If the resident cache is full, the least recently used neuron state is evicted and saved.
 6. The CUDA backend wakes work for the target neuron and applies the spike computation.
 
-The current `NeuronStateCache` is a CPU/reference abstraction for this policy. It is intentionally separate from CUDA kernels so eviction semantics can be tested before device memory management is optimized.
+The current `NeuronStateCache` is a CPU/reference abstraction for this policy.
+It is intentionally separate from CUDA kernels so eviction semantics can be
+tested before device memory management is optimized. CUDA kernels currently run
+resident propagation over compact device arrays; host/device cold-state paging
+is still a future optimization.
 
 ## Spike Delivery Queue
 
@@ -40,11 +47,12 @@ Spike delivery uses a circular timing wheel rather than a heap. Each simulation 
 
 This is the default because fixed-timestep SNN simulations schedule large numbers of near-future spikes. A timing wheel gives O(1) amortized insertion and avoids heap churn in dense traffic. The implementation still stores absolute delivery ticks inside each bucket, so events farther in the future than one wheel rotation are retained until their real tick arrives.
 
-The CUDA path should eventually translate each due bucket into target-neuron batches:
+The CUDA path translates fired neurons and scheduled synapse events into compact
+device arrays. Future paging work should add:
 
 - group due spikes by target neuron or resident-state page
 - load cold neuron state through the LRU residency layer
-- launch or enqueue device work for the active target set
+- launch or enqueue device work for active target sets
 - preserve absolute tick ordering for STDP and temporal pattern windows
 
 ## Propagation Plumbing
@@ -57,17 +65,44 @@ events through outgoing synapses whenever a neuron fires.
 This is intentionally small and deterministic. CUDA kernels should match this behavior before
 introducing batching, device-resident state pages, or parallel delivery optimizations.
 
+## Synapse/Dendrite/Receptor Stage
+
+Spikes are not applied directly as "weight into soma membrane." They enter a
+synapse/dendrite processing stage:
+
+1. receptor dynamics convert synapse weight into signed current
+2. current is integrated into soma, basal, apical, or inhibitory compartments
+3. compartments decay by receptor-specific time constants
+4. membrane potential is computed from the compartment state
+5. firing resets the neuron and schedules downstream synapse events
+6. STDP updates run on pre/post spike timing when plasticity is enabled
+
+CPU and CUDA paths both implement this stage.
+
+## Synapse Spike Codes
+
+Each synapse can define `spike_code_offsets`. When the source neuron fires, the
+runtime schedules one spike for each offset. This makes temporal identity a
+synapse property rather than only a neuron property. The receiving synapse keeps
+its own learned code-pattern state and match counters, while the target neuron
+continues to maintain neuron-level temporal-pattern state.
+
+The CUDA implementation supports code expansion and synapse-code recognition
+with a fixed capacity of 8 offsets per code.
+
 ## Core Framework Direction
 
-The codebase now has compileable foundation types for:
+The codebase now has reusable library types for:
 
 - brain hierarchy: `Brain -> Hemisphere -> Lobe -> Region -> Nucleus -> Column -> Layer -> Cluster -> Neuron`
 - canonical cortical columns with named `L1`, `L2/3`, `L4`, `L5`, and `L6` layer groups
 - spike events and retrograde events
 - STDP enable/disable and causal weight updates
 - temporal pattern matching
+- synapse-specific emitted spike codes
 - object storage and LRU state caching
 - parser registry and declarative loader interfaces
+- installable CMake package and minimal C ABI
 
 The SNNFrame concepts are carried forward as boundaries and data models, not as experiment-specific code.
 
@@ -80,7 +115,8 @@ The SNNFrame concepts are carried forward as boundaries and data models, not as 
 
 ## Deferred Implementation Choices
 
-- RocksDB is represented by a storage boundary, but the concrete RocksDB adapter is not wired until dependency policy is chosen.
+- RocksDB is represented by a storage boundary; the default build does not
+  require RocksDB.
 - Native JSON, SONATA, NeuroML, and HOC now normalize into `NetworkIR`, then flatten into `Connectome`.
 - SONATA support parses the JSON circuit config, SNNCuda/SNNFrame extension sections, and direct HDF5 node/edge files when HDF5 is available.
 - CUDA kernels should start by implementing CPU-equivalent neuron-state updates, then add batching and memory-residency optimization.
