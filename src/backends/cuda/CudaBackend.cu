@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -448,6 +449,28 @@ __global__ void initialize_initial_fired_kernel(
     }
 }
 
+__global__ void initialize_external_fired_kernel(
+    const int* fired,
+    int fired_count,
+    unsigned long long tick,
+    const int* incoming_offsets,
+    const int* incoming_edges,
+    unsigned long long* spike_counts,
+    unsigned long long* last_fired_ticks,
+    unsigned long long* synapse_last_post_tick) {
+    const auto index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= fired_count) {
+        return;
+    }
+
+    const auto neuron = fired[index];
+    ++spike_counts[neuron];
+    last_fired_ticks[neuron] = tick;
+    for (auto edge = incoming_offsets[neuron]; edge < incoming_offsets[neuron + 1]; ++edge) {
+        synapse_last_post_tick[incoming_edges[edge]] = tick;
+    }
+}
+
 __global__ void mark_fired_flags_kernel(
     const int* fired,
     int fired_count,
@@ -740,6 +763,795 @@ __global__ void process_synapse_events_kernel(
 } // namespace
 
 namespace snncuda::backends {
+
+namespace {
+
+template <typename T>
+class DeviceBuffer {
+public:
+    DeviceBuffer() = default;
+    explicit DeviceBuffer(std::size_t count) {
+        allocate(count);
+    }
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+    DeviceBuffer(DeviceBuffer&& other) noexcept
+        : ptr_(other.ptr_)
+        , count_(other.count_) {
+        other.ptr_ = nullptr;
+        other.count_ = 0;
+    }
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+        if (this != &other) {
+            reset();
+            ptr_ = other.ptr_;
+            count_ = other.count_;
+            other.ptr_ = nullptr;
+            other.count_ = 0;
+        }
+        return *this;
+    }
+    ~DeviceBuffer() {
+        reset();
+    }
+
+    void allocate(std::size_t count) {
+        reset();
+        count_ = count;
+        if (count_ > 0) {
+            check_cuda(cudaMalloc(reinterpret_cast<void**>(&ptr_), count_ * sizeof(T)), "cudaMalloc device buffer");
+        }
+    }
+
+    void upload(const std::vector<T>& values) {
+        allocate(values.size());
+        if (!values.empty()) {
+            check_cuda(
+                cudaMemcpy(ptr_, values.data(), values.size() * sizeof(T), cudaMemcpyHostToDevice),
+                "cudaMemcpy host-to-device");
+        }
+    }
+
+    void copy_from_host(const T* values, std::size_t count, std::size_t offset = 0) {
+        if (count == 0) {
+            return;
+        }
+        if (offset + count > count_) {
+            throw std::runtime_error("device buffer copy exceeds allocation");
+        }
+        check_cuda(
+            cudaMemcpy(ptr_ + offset, values, count * sizeof(T), cudaMemcpyHostToDevice),
+            "cudaMemcpy host-to-device");
+    }
+
+    void zero() {
+        if (ptr_ != nullptr && count_ > 0) {
+            check_cuda(cudaMemset(ptr_, 0, count_ * sizeof(T)), "cudaMemset device buffer");
+        }
+    }
+
+    void reset() noexcept {
+        if (ptr_ != nullptr) {
+            cudaFree(ptr_);
+            ptr_ = nullptr;
+        }
+        count_ = 0;
+    }
+
+    [[nodiscard]] T* get() noexcept {
+        return ptr_;
+    }
+    [[nodiscard]] const T* get() const noexcept {
+        return ptr_;
+    }
+    [[nodiscard]] std::size_t size() const noexcept {
+        return count_;
+    }
+
+private:
+    T* ptr_{nullptr};
+    std::size_t count_{0};
+};
+
+std::vector<unsigned long long> copy_u64_from_device(unsigned long long* device, std::size_t count, const char* context) {
+    std::vector<unsigned long long> values(count, 0);
+    if (count > 0) {
+        check_cuda(
+            cudaMemcpy(values.data(), device, count * sizeof(unsigned long long), cudaMemcpyDeviceToHost),
+            context);
+    }
+    return values;
+}
+
+CudaDebugMetrics metrics_from_device(
+    unsigned long long* device_metrics,
+    const CudaDebugMetrics& host_debug) {
+    auto debug = host_debug;
+    std::vector<unsigned long long> raw_metrics(metric_count, 0);
+    check_cuda(
+        cudaMemcpy(
+            raw_metrics.data(),
+            device_metrics,
+            raw_metrics.size() * sizeof(unsigned long long),
+            cudaMemcpyDeviceToHost),
+        "cudaMemcpy debug metrics");
+    debug.scheduled_event_requests = raw_metrics[metric_scheduled_event_requests];
+    debug.scheduled_events = raw_metrics[metric_scheduled_events];
+    debug.processed_events = raw_metrics[metric_processed_events];
+    debug.dropped_events += raw_metrics[metric_dropped_events];
+    debug.fired_appends = raw_metrics[metric_fired_appends];
+    debug.fired_overflow = raw_metrics[metric_fired_overflow];
+    debug.lock_spin_iterations = raw_metrics[metric_lock_spin_iterations];
+    debug.lock_timeouts = raw_metrics[metric_lock_timeouts];
+    debug.stdp_updates = raw_metrics[metric_stdp_updates];
+    debug.stdp_ltp = raw_metrics[metric_stdp_ltp];
+    debug.stdp_ltd = raw_metrics[metric_stdp_ltd];
+    debug.receptor_ampa_events = raw_metrics[metric_receptor_ampa_events];
+    debug.receptor_nmda_events = raw_metrics[metric_receptor_nmda_events];
+    debug.receptor_gaba_a_events = raw_metrics[metric_receptor_gaba_a_events];
+    debug.receptor_gaba_b_events = raw_metrics[metric_receptor_gaba_b_events];
+    debug.dendritic_integrations = raw_metrics[metric_dendritic_integrations];
+    debug.post_plasticity_scans = raw_metrics[metric_post_plasticity_scans];
+    debug.temporal_observations = raw_metrics[metric_temporal_observations];
+    debug.temporal_patterns_learned = raw_metrics[metric_temporal_patterns_learned];
+    debug.temporal_matches = raw_metrics[metric_temporal_matches];
+    return debug;
+}
+
+} // namespace
+
+class CudaInferenceSession::Impl {
+public:
+    explicit Impl(const declarative::Connectome& connectome)
+        : available_(cuda_available())
+        , neuron_count_(connectome.neurons.size()) {
+        if (!available_ || connectome.neurons.empty()) {
+            return;
+        }
+        pack(connectome);
+        upload_immutable();
+        reset_state();
+    }
+
+    [[nodiscard]] bool available() const noexcept {
+        return available_;
+    }
+
+    void reset_state() {
+        mutable_allocated_ = false;
+        mutable_state_initialized_ = false;
+    }
+
+    [[nodiscard]] CudaInferenceBatchResult run_batch(
+        const std::vector<CudaInferenceSample>& samples,
+        const CudaInferenceOptions& options) {
+        if (!available_) {
+            return {};
+        }
+
+        CudaInferenceBatchResult batch;
+        batch.executed = true;
+        batch.samples.reserve(samples.size());
+        const auto start = std::chrono::steady_clock::now();
+        ensure_mutable_capacity(options.max_steps, max_sample_input_count(samples));
+
+        for (const auto& sample : samples) {
+            if (options.reset_state_between_samples) {
+                reset_mutable_buffers(options.max_steps);
+            } else if (!mutable_state_initialized_) {
+                reset_mutable_buffers(options.max_steps);
+            } else {
+                reset_sample_work_buffers();
+            }
+            batch.samples.push_back(run_one(sample, options));
+        }
+
+        const auto end = std::chrono::steady_clock::now();
+        batch.elapsed_seconds = std::chrono::duration<double>(end - start).count();
+        return batch;
+    }
+
+private:
+    static bool cuda_available() noexcept {
+        int device_count = 0;
+        return cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0;
+    }
+
+    void pack(const declarative::Connectome& connectome) {
+        dense_index_.reserve(connectome.neurons.size());
+        thresholds_.assign(connectome.neurons.size(), 1.0F);
+        temporal_window_ticks_.assign(connectome.neurons.size(), 500);
+        temporal_similarity_thresholds_.assign(connectome.neurons.size(), 0.93F);
+        temporal_max_patterns_.assign(connectome.neurons.size(), 1);
+        for (std::size_t i = 0; i < connectome.neurons.size(); ++i) {
+            dense_index_[connectome.neurons[i].id] = static_cast<int>(i);
+            thresholds_[i] = connectome.neurons[i].params.threshold;
+            temporal_window_ticks_[i] = connectome.neurons[i].params.pattern_window_ticks;
+            temporal_similarity_thresholds_[i] = connectome.neurons[i].params.similarity_threshold;
+            temporal_max_patterns_[i] = static_cast<unsigned int>(
+                std::min<std::size_t>(connectome.neurons[i].params.max_reference_patterns, 1));
+        }
+
+        std::vector<std::vector<int>> outgoing(connectome.neurons.size());
+        std::vector<std::vector<int>> incoming(connectome.neurons.size());
+        edge_targets_.reserve(connectome.synapses.size());
+        edge_delays_.reserve(connectome.synapses.size());
+        edge_compartments_.reserve(connectome.synapses.size());
+        edge_receptors_.reserve(connectome.synapses.size());
+        edge_plasticity_.reserve(connectome.synapses.size());
+        edge_code_offsets_.reserve(connectome.synapses.size() * spike_code_capacity);
+        edge_code_counts_.reserve(connectome.synapses.size());
+        edge_code_window_ticks_.reserve(connectome.synapses.size());
+        edge_code_similarity_thresholds_.reserve(connectome.synapses.size());
+        edge_code_max_patterns_.reserve(connectome.synapses.size());
+        initial_edge_weights_.reserve(connectome.synapses.size());
+        edge_max_weights_.reserve(connectome.synapses.size());
+
+        for (const auto& synapse : connectome.synapses) {
+            const auto source = dense_index_.find(synapse.source);
+            const auto target = dense_index_.find(synapse.target);
+            if (source == dense_index_.end() || target == dense_index_.end()) {
+                continue;
+            }
+            const auto edge = static_cast<int>(edge_targets_.size());
+            edge_targets_.push_back(target->second);
+            edge_delays_.push_back(std::max(1U, synapse.delay_ticks));
+            const auto code_count = static_cast<unsigned int>(
+                std::min<std::size_t>(
+                    synapse.spike_code_offsets.empty() ? 1 : synapse.spike_code_offsets.size(),
+                    spike_code_capacity));
+            edge_code_counts_.push_back(code_count);
+            for (int code = 0; code < spike_code_capacity; ++code) {
+                if (code < static_cast<int>(code_count) && !synapse.spike_code_offsets.empty()) {
+                    edge_code_offsets_.push_back(synapse.spike_code_offsets[static_cast<std::size_t>(code)]);
+                } else {
+                    edge_code_offsets_.push_back(0U);
+                }
+            }
+            edge_compartments_.push_back(static_cast<int>(synapse.compartment));
+            edge_receptors_.push_back(static_cast<int>(synapse.receptor));
+            edge_plasticity_.push_back(synapse.plasticity_enabled ? 1 : 0);
+            initial_edge_weights_.push_back(synapse.weight);
+            edge_max_weights_.push_back(synapse.max_weight);
+            edge_code_window_ticks_.push_back(temporal_window_ticks_[static_cast<std::size_t>(target->second)]);
+            edge_code_similarity_thresholds_.push_back(
+                temporal_similarity_thresholds_[static_cast<std::size_t>(target->second)]);
+            edge_code_max_patterns_.push_back(1U);
+            outgoing[source->second].push_back(edge);
+            incoming[target->second].push_back(edge);
+        }
+
+        outgoing_offsets_.assign(connectome.neurons.size() + 1, 0);
+        incoming_offsets_.assign(connectome.neurons.size() + 1, 0);
+        for (std::size_t neuron = 0; neuron < outgoing.size(); ++neuron) {
+            outgoing_offsets_[neuron] = static_cast<int>(outgoing_edges_.size());
+            for (const auto edge : outgoing[neuron]) {
+                outgoing_edges_.push_back(edge);
+            }
+        }
+        outgoing_offsets_.back() = static_cast<int>(outgoing_edges_.size());
+        for (std::size_t neuron = 0; neuron < incoming.size(); ++neuron) {
+            incoming_offsets_[neuron] = static_cast<int>(incoming_edges_.size());
+            for (const auto edge : incoming[neuron]) {
+                incoming_edges_.push_back(edge);
+            }
+        }
+        incoming_offsets_.back() = static_cast<int>(incoming_edges_.size());
+    }
+
+    void upload_immutable() {
+        device_offsets_.upload(outgoing_offsets_);
+        device_outgoing_edges_.upload(outgoing_edges_);
+        device_incoming_offsets_.upload(incoming_offsets_);
+        device_incoming_edges_.upload(incoming_edges_);
+        device_targets_.upload(edge_targets_);
+        device_delays_.upload(edge_delays_);
+        device_code_offsets_.upload(edge_code_offsets_);
+        device_code_counts_.upload(edge_code_counts_);
+        device_edge_code_window_ticks_.upload(edge_code_window_ticks_);
+        device_edge_code_similarity_thresholds_.upload(edge_code_similarity_thresholds_);
+        device_edge_code_max_patterns_.upload(edge_code_max_patterns_);
+        device_compartments_.upload(edge_compartments_);
+        device_receptors_.upload(edge_receptors_);
+        device_plasticity_.upload(edge_plasticity_);
+        device_max_weights_.upload(edge_max_weights_);
+        device_thresholds_.upload(thresholds_);
+        device_temporal_window_ticks_.upload(temporal_window_ticks_);
+        device_temporal_similarity_thresholds_.upload(temporal_similarity_thresholds_);
+        device_temporal_max_patterns_.upload(temporal_max_patterns_);
+    }
+
+    std::size_t max_sample_input_count(const std::vector<CudaInferenceSample>& samples) const {
+        std::size_t max_count = 1;
+        for (const auto& sample : samples) {
+            max_count = std::max(max_count, sample.inputs.size());
+        }
+        return max_count;
+    }
+
+    void ensure_mutable_capacity(std::uint32_t max_steps, std::size_t max_inputs) {
+        const auto tick_count = static_cast<std::size_t>(max_steps) + 1;
+        const auto event_capacity = std::max<std::size_t>(1, edge_targets_.size());
+        const auto fired_capacity = std::max<std::size_t>({1, neuron_count_, max_inputs});
+        if (mutable_allocated_
+            && allocated_tick_count_ >= tick_count
+            && allocated_event_capacity_ >= event_capacity
+            && allocated_fired_capacity_ >= fired_capacity) {
+            return;
+        }
+
+        allocated_tick_count_ = tick_count;
+        allocated_event_capacity_ = event_capacity;
+        allocated_fired_capacity_ = fired_capacity;
+        const auto edge_count = edge_targets_.size();
+
+        device_membrane_.allocate(neuron_count_);
+        device_soma_.allocate(neuron_count_);
+        device_basal_.allocate(neuron_count_);
+        device_apical_.allocate(neuron_count_);
+        device_inhibitory_.allocate(neuron_count_);
+        device_soma_tau_.allocate(neuron_count_);
+        device_basal_tau_.allocate(neuron_count_);
+        device_apical_tau_.allocate(neuron_count_);
+        device_inhibitory_tau_.allocate(neuron_count_);
+        device_soma_ticks_.allocate(neuron_count_);
+        device_basal_ticks_.allocate(neuron_count_);
+        device_apical_ticks_.allocate(neuron_count_);
+        device_inhibitory_ticks_.allocate(neuron_count_);
+        device_spike_counts_.allocate(neuron_count_);
+        device_last_fired_ticks_.allocate(neuron_count_);
+        device_temporal_window_start_.allocate(neuron_count_);
+        device_temporal_observed_offsets_.allocate(neuron_count_ * temporal_capacity);
+        device_temporal_observed_counts_.allocate(neuron_count_);
+        device_temporal_reference_offsets_.allocate(neuron_count_ * temporal_capacity);
+        device_temporal_reference_counts_.allocate(neuron_count_);
+        device_temporal_learned_counts_.allocate(neuron_count_);
+        device_temporal_match_counts_.allocate(neuron_count_);
+        device_temporal_last_match_.allocate(neuron_count_);
+        device_weights_.allocate(edge_count);
+        device_last_pre_ticks_.allocate(edge_count);
+        device_last_post_ticks_.allocate(edge_count);
+        device_pre_counts_.allocate(edge_count);
+        device_plasticity_updates_.allocate(edge_count);
+        device_last_weight_delta_.allocate(edge_count);
+        device_edge_code_window_start_.allocate(edge_count);
+        device_edge_code_observed_offsets_.allocate(edge_count * temporal_capacity);
+        device_edge_code_observed_counts_.allocate(edge_count);
+        device_edge_code_reference_offsets_.allocate(edge_count * temporal_capacity);
+        device_edge_code_reference_counts_.allocate(edge_count);
+        device_edge_code_learned_counts_.allocate(edge_count);
+        device_edge_code_match_counts_.allocate(edge_count);
+        device_edge_code_last_match_.allocate(edge_count);
+        device_neuron_locks_.allocate(neuron_count_);
+        device_fired_flags_.allocate(neuron_count_);
+        device_scheduled_edges_.allocate(tick_count * event_capacity);
+        device_scheduled_counts_.allocate(tick_count);
+        device_fired_by_tick_.allocate(tick_count * fired_capacity);
+        device_fired_counts_.allocate(tick_count);
+        device_metrics_.allocate(metric_count);
+        mutable_allocated_ = true;
+        mutable_state_initialized_ = false;
+    }
+
+    void reset_mutable_buffers(std::uint32_t max_steps) {
+        const auto edge_count = edge_targets_.size();
+        device_membrane_.zero();
+        device_soma_.zero();
+        device_basal_.zero();
+        device_apical_.zero();
+        device_inhibitory_.zero();
+        device_soma_ticks_.zero();
+        device_basal_ticks_.zero();
+        device_apical_ticks_.zero();
+        device_inhibitory_ticks_.zero();
+        device_spike_counts_.zero();
+        device_temporal_window_start_.zero();
+        device_temporal_observed_offsets_.zero();
+        device_temporal_observed_counts_.zero();
+        device_temporal_reference_offsets_.zero();
+        device_temporal_reference_counts_.zero();
+        device_temporal_learned_counts_.zero();
+        device_temporal_match_counts_.zero();
+        device_temporal_last_match_.zero();
+        device_pre_counts_.zero();
+        device_plasticity_updates_.zero();
+        device_last_weight_delta_.zero();
+        device_edge_code_window_start_.zero();
+        device_edge_code_observed_offsets_.zero();
+        device_edge_code_observed_counts_.zero();
+        device_edge_code_reference_offsets_.zero();
+        device_edge_code_reference_counts_.zero();
+        device_edge_code_learned_counts_.zero();
+        device_edge_code_match_counts_.zero();
+        device_edge_code_last_match_.zero();
+        device_neuron_locks_.zero();
+        device_fired_flags_.zero();
+        device_scheduled_counts_.zero();
+        device_fired_counts_.zero();
+        device_metrics_.zero();
+
+        std::vector<float> soma_tau(neuron_count_, 5.0F);
+        std::vector<float> basal_tau(neuron_count_, 5.0F);
+        std::vector<float> apical_tau(neuron_count_, 100.0F);
+        std::vector<float> inhibitory_tau(neuron_count_, 10.0F);
+        device_soma_tau_.copy_from_host(soma_tau.data(), soma_tau.size());
+        device_basal_tau_.copy_from_host(basal_tau.data(), basal_tau.size());
+        device_apical_tau_.copy_from_host(apical_tau.data(), apical_tau.size());
+        device_inhibitory_tau_.copy_from_host(inhibitory_tau.data(), inhibitory_tau.size());
+
+        std::vector<unsigned long long> invalid_neuron_ticks(neuron_count_, invalid_tick);
+        device_last_fired_ticks_.copy_from_host(invalid_neuron_ticks.data(), invalid_neuron_ticks.size());
+        if (edge_count > 0) {
+            std::vector<unsigned long long> invalid_edge_ticks(edge_count, invalid_tick);
+            device_last_pre_ticks_.copy_from_host(invalid_edge_ticks.data(), invalid_edge_ticks.size());
+            device_last_post_ticks_.copy_from_host(invalid_edge_ticks.data(), invalid_edge_ticks.size());
+            device_weights_.copy_from_host(initial_edge_weights_.data(), initial_edge_weights_.size());
+        }
+        mutable_state_initialized_ = true;
+        (void)max_steps;
+    }
+
+    void reset_sample_work_buffers() {
+        device_neuron_locks_.zero();
+        device_fired_flags_.zero();
+        device_scheduled_counts_.zero();
+        device_fired_counts_.zero();
+        device_metrics_.zero();
+    }
+
+    std::vector<std::vector<int>> dense_inputs_by_tick(
+        const CudaInferenceSample& sample,
+        std::uint32_t max_steps) const {
+        std::vector<std::vector<int>> by_tick(static_cast<std::size_t>(max_steps) + 1);
+        std::unordered_set<unsigned long long> seen;
+        seen.reserve(sample.inputs.size());
+        for (const auto& input : sample.inputs) {
+            if (input.tick > max_steps) {
+                continue;
+            }
+            const auto found = dense_index_.find(input.neuron);
+            if (found == dense_index_.end()) {
+                continue;
+            }
+            const auto key = (static_cast<unsigned long long>(input.tick) << 32U)
+                | static_cast<unsigned int>(found->second);
+            if (seen.insert(key).second) {
+                by_tick[input.tick].push_back(found->second);
+            }
+        }
+        return by_tick;
+    }
+
+    void seed_external_inputs(const std::vector<std::vector<int>>& by_tick) {
+        std::vector<int> counts(by_tick.size(), 0);
+        for (std::size_t tick = 0; tick < by_tick.size(); ++tick) {
+            counts[tick] = static_cast<int>(by_tick[tick].size());
+            if (!by_tick[tick].empty()) {
+                device_fired_by_tick_.copy_from_host(
+                    by_tick[tick].data(),
+                    by_tick[tick].size(),
+                    tick * allocated_fired_capacity_);
+            }
+        }
+        device_fired_counts_.copy_from_host(counts.data(), counts.size());
+
+        const auto threads = 256;
+        for (std::size_t tick = 0; tick < by_tick.size(); ++tick) {
+            const auto count = static_cast<int>(by_tick[tick].size());
+            if (count == 0) {
+                continue;
+            }
+            const auto blocks = (count + threads - 1) / threads;
+            initialize_external_fired_kernel<<<blocks, threads>>>(
+                device_fired_by_tick_.get() + tick * allocated_fired_capacity_,
+                count,
+                static_cast<unsigned long long>(tick),
+                device_incoming_offsets_.get(),
+                device_incoming_edges_.get(),
+                device_spike_counts_.get(),
+                device_last_fired_ticks_.get(),
+                device_last_post_ticks_.get());
+            check_cuda(cudaGetLastError(), "initialize_external_fired_kernel launch");
+            check_cuda(cudaDeviceSynchronize(), "initialize_external_fired_kernel synchronize");
+        }
+    }
+
+    CudaInferenceSampleResult run_one(
+        const CudaInferenceSample& sample,
+        const CudaInferenceOptions& options) {
+        const auto by_tick = dense_inputs_by_tick(sample, options.max_steps);
+        const auto initial_spike_counts = copy_u64_from_device(
+            device_spike_counts_.get(),
+            neuron_count_,
+            "cudaMemcpy initial inference spike counts");
+        seed_external_inputs(by_tick);
+
+        CudaInferenceSampleResult result;
+        result.delivered_spikes = 0;
+        for (const auto& inputs : by_tick) {
+            result.delivered_spikes += inputs.size();
+        }
+        result.fired_spikes = result.delivered_spikes;
+        CudaDebugMetrics debug;
+        const auto threads = 256;
+        const auto edge_count = edge_targets_.size();
+
+        for (std::uint32_t tick = 0; tick <= options.max_steps; ++tick) {
+            ++debug.ticks_processed;
+            device_fired_flags_.zero();
+
+            int fired_before = 0;
+            check_cuda(
+                cudaMemcpy(
+                    &fired_before,
+                    device_fired_counts_.get() + tick,
+                    sizeof(int),
+                    cudaMemcpyDeviceToHost),
+                "cudaMemcpy fired before");
+            if (fired_before > 0) {
+                const auto mark_blocks = (fired_before + threads - 1) / threads;
+                mark_fired_flags_kernel<<<mark_blocks, threads>>>(
+                    device_fired_by_tick_.get() + static_cast<std::size_t>(tick) * allocated_fired_capacity_,
+                    std::min(fired_before, static_cast<int>(allocated_fired_capacity_)),
+                    device_fired_flags_.get());
+                check_cuda(cudaGetLastError(), "mark_fired_flags_kernel launch");
+                check_cuda(cudaDeviceSynchronize(), "mark_fired_flags_kernel synchronize");
+            }
+
+            int event_count = 0;
+            check_cuda(
+                cudaMemcpy(
+                    &event_count,
+                    device_scheduled_counts_.get() + tick,
+                    sizeof(int),
+                    cudaMemcpyDeviceToHost),
+                "cudaMemcpy event count");
+            debug.max_scheduled_events_per_tick = std::max(
+                debug.max_scheduled_events_per_tick,
+                static_cast<std::uint64_t>(std::max(event_count, 0)));
+            if (event_count > 0) {
+                const auto clamped_event_count = std::min(event_count, static_cast<int>(allocated_event_capacity_));
+                if (event_count > clamped_event_count) {
+                    debug.dropped_events += static_cast<std::uint64_t>(event_count - clamped_event_count);
+                }
+                const auto event_blocks = (clamped_event_count + threads - 1) / threads;
+                process_synapse_events_kernel<<<event_blocks, threads>>>(
+                    device_scheduled_edges_.get() + static_cast<std::size_t>(tick) * allocated_event_capacity_,
+                    clamped_event_count,
+                    device_fired_by_tick_.get() + static_cast<std::size_t>(tick) * allocated_fired_capacity_,
+                    device_fired_counts_.get() + tick,
+                    static_cast<int>(allocated_fired_capacity_),
+                    tick,
+                    device_targets_.get(),
+                    device_delays_.get(),
+                    device_code_counts_.get(),
+                    device_compartments_.get(),
+                    device_receptors_.get(),
+                    device_plasticity_.get(),
+                    device_incoming_offsets_.get(),
+                    device_incoming_edges_.get(),
+                    device_weights_.get(),
+                    device_max_weights_.get(),
+                    device_last_pre_ticks_.get(),
+                    device_last_post_ticks_.get(),
+                    device_pre_counts_.get(),
+                    device_plasticity_updates_.get(),
+                    device_last_weight_delta_.get(),
+                    device_thresholds_.get(),
+                    device_membrane_.get(),
+                    device_soma_.get(),
+                    device_basal_.get(),
+                    device_apical_.get(),
+                    device_inhibitory_.get(),
+                    device_soma_ticks_.get(),
+                    device_basal_ticks_.get(),
+                    device_apical_ticks_.get(),
+                    device_inhibitory_ticks_.get(),
+                    device_soma_tau_.get(),
+                    device_basal_tau_.get(),
+                    device_apical_tau_.get(),
+                    device_inhibitory_tau_.get(),
+                    device_spike_counts_.get(),
+                    device_last_fired_ticks_.get(),
+                    device_neuron_locks_.get(),
+                    device_fired_flags_.get(),
+                    device_temporal_window_ticks_.get(),
+                    device_temporal_similarity_thresholds_.get(),
+                    device_temporal_max_patterns_.get(),
+                    device_temporal_window_start_.get(),
+                    device_temporal_observed_offsets_.get(),
+                    device_temporal_observed_counts_.get(),
+                    device_temporal_reference_offsets_.get(),
+                    device_temporal_reference_counts_.get(),
+                    device_temporal_learned_counts_.get(),
+                    device_temporal_match_counts_.get(),
+                    device_temporal_last_match_.get(),
+                    device_edge_code_window_ticks_.get(),
+                    device_edge_code_similarity_thresholds_.get(),
+                    device_edge_code_max_patterns_.get(),
+                    device_edge_code_window_start_.get(),
+                    device_edge_code_observed_offsets_.get(),
+                    device_edge_code_observed_counts_.get(),
+                    device_edge_code_reference_offsets_.get(),
+                    device_edge_code_reference_counts_.get(),
+                    device_edge_code_learned_counts_.get(),
+                    device_edge_code_match_counts_.get(),
+                    device_edge_code_last_match_.get(),
+                    device_metrics_.get());
+                check_cuda(cudaGetLastError(), "process_synapse_events_kernel launch");
+                check_cuda(cudaDeviceSynchronize(), "process_synapse_events_kernel synchronize");
+                result.delivered_spikes += static_cast<std::uint64_t>(clamped_event_count);
+            }
+
+            int fired_after = 0;
+            check_cuda(
+                cudaMemcpy(
+                    &fired_after,
+                    device_fired_counts_.get() + tick,
+                    sizeof(int),
+                    cudaMemcpyDeviceToHost),
+                "cudaMemcpy fired after");
+            debug.max_fired_neurons_per_tick = std::max(
+                debug.max_fired_neurons_per_tick,
+                static_cast<std::uint64_t>(std::max(fired_after, 0)));
+            result.fired_spikes += static_cast<std::uint64_t>(std::max(0, fired_after - fired_before));
+
+            if (fired_after > 0 && tick < options.max_steps && edge_count > 0) {
+                const auto expand_blocks = (fired_after + threads - 1) / threads;
+                expand_fired_kernel<<<expand_blocks, threads>>>(
+                    device_fired_by_tick_.get() + static_cast<std::size_t>(tick) * allocated_fired_capacity_,
+                    std::min(fired_after, static_cast<int>(allocated_fired_capacity_)),
+                    device_offsets_.get(),
+                    device_outgoing_edges_.get(),
+                    device_delays_.get(),
+                    device_code_offsets_.get(),
+                    device_code_counts_.get(),
+                    device_scheduled_edges_.get(),
+                    device_scheduled_counts_.get(),
+                    static_cast<int>(allocated_event_capacity_),
+                    tick,
+                    options.max_steps,
+                    device_metrics_.get());
+                check_cuda(cudaGetLastError(), "expand_fired_kernel launch");
+                check_cuda(cudaDeviceSynchronize(), "expand_fired_kernel synchronize");
+            }
+        }
+
+        result.debug = metrics_from_device(device_metrics_.get(), debug);
+        const auto spike_counts = copy_u64_from_device(
+            device_spike_counts_.get(),
+            neuron_count_,
+            "cudaMemcpy inference spike counts");
+        result.readout_spike_counts.reserve(options.readout_neurons.size());
+        for (const auto id : options.readout_neurons) {
+            const auto found = dense_index_.find(id);
+            if (found == dense_index_.end()) {
+                result.readout_spike_counts.push_back(0);
+            } else {
+                const auto index = static_cast<std::size_t>(found->second);
+                result.readout_spike_counts.push_back(
+                    static_cast<std::uint64_t>(spike_counts[index] - initial_spike_counts[index]));
+            }
+        }
+        return result;
+    }
+
+    bool available_{false};
+    bool mutable_allocated_{false};
+    bool mutable_state_initialized_{false};
+    std::size_t neuron_count_{0};
+    std::size_t allocated_tick_count_{0};
+    std::size_t allocated_event_capacity_{0};
+    std::size_t allocated_fired_capacity_{0};
+
+    std::unordered_map<core::NeuronId, int> dense_index_;
+    std::vector<float> thresholds_;
+    std::vector<unsigned long long> temporal_window_ticks_;
+    std::vector<float> temporal_similarity_thresholds_;
+    std::vector<unsigned int> temporal_max_patterns_;
+    std::vector<int> outgoing_offsets_;
+    std::vector<int> outgoing_edges_;
+    std::vector<int> incoming_offsets_;
+    std::vector<int> incoming_edges_;
+    std::vector<int> edge_targets_;
+    std::vector<unsigned int> edge_delays_;
+    std::vector<int> edge_compartments_;
+    std::vector<int> edge_receptors_;
+    std::vector<int> edge_plasticity_;
+    std::vector<unsigned int> edge_code_offsets_;
+    std::vector<unsigned int> edge_code_counts_;
+    std::vector<unsigned long long> edge_code_window_ticks_;
+    std::vector<float> edge_code_similarity_thresholds_;
+    std::vector<unsigned int> edge_code_max_patterns_;
+    std::vector<float> initial_edge_weights_;
+    std::vector<float> edge_max_weights_;
+
+    DeviceBuffer<int> device_offsets_;
+    DeviceBuffer<int> device_outgoing_edges_;
+    DeviceBuffer<int> device_incoming_offsets_;
+    DeviceBuffer<int> device_incoming_edges_;
+    DeviceBuffer<int> device_targets_;
+    DeviceBuffer<unsigned int> device_delays_;
+    DeviceBuffer<unsigned int> device_code_offsets_;
+    DeviceBuffer<unsigned int> device_code_counts_;
+    DeviceBuffer<unsigned long long> device_edge_code_window_ticks_;
+    DeviceBuffer<float> device_edge_code_similarity_thresholds_;
+    DeviceBuffer<unsigned int> device_edge_code_max_patterns_;
+    DeviceBuffer<int> device_compartments_;
+    DeviceBuffer<int> device_receptors_;
+    DeviceBuffer<int> device_plasticity_;
+    DeviceBuffer<float> device_max_weights_;
+    DeviceBuffer<float> device_thresholds_;
+    DeviceBuffer<unsigned long long> device_temporal_window_ticks_;
+    DeviceBuffer<float> device_temporal_similarity_thresholds_;
+    DeviceBuffer<unsigned int> device_temporal_max_patterns_;
+
+    DeviceBuffer<float> device_membrane_;
+    DeviceBuffer<float> device_soma_;
+    DeviceBuffer<float> device_basal_;
+    DeviceBuffer<float> device_apical_;
+    DeviceBuffer<float> device_inhibitory_;
+    DeviceBuffer<float> device_soma_tau_;
+    DeviceBuffer<float> device_basal_tau_;
+    DeviceBuffer<float> device_apical_tau_;
+    DeviceBuffer<float> device_inhibitory_tau_;
+    DeviceBuffer<unsigned long long> device_soma_ticks_;
+    DeviceBuffer<unsigned long long> device_basal_ticks_;
+    DeviceBuffer<unsigned long long> device_apical_ticks_;
+    DeviceBuffer<unsigned long long> device_inhibitory_ticks_;
+    DeviceBuffer<unsigned long long> device_spike_counts_;
+    DeviceBuffer<unsigned long long> device_last_fired_ticks_;
+    DeviceBuffer<float> device_weights_;
+    DeviceBuffer<unsigned long long> device_last_pre_ticks_;
+    DeviceBuffer<unsigned long long> device_last_post_ticks_;
+    DeviceBuffer<unsigned long long> device_pre_counts_;
+    DeviceBuffer<unsigned long long> device_plasticity_updates_;
+    DeviceBuffer<float> device_last_weight_delta_;
+    DeviceBuffer<int> device_neuron_locks_;
+    DeviceBuffer<int> device_fired_flags_;
+    DeviceBuffer<int> device_scheduled_edges_;
+    DeviceBuffer<int> device_scheduled_counts_;
+    DeviceBuffer<int> device_fired_by_tick_;
+    DeviceBuffer<int> device_fired_counts_;
+    DeviceBuffer<unsigned long long> device_temporal_window_start_;
+    DeviceBuffer<unsigned int> device_temporal_observed_offsets_;
+    DeviceBuffer<unsigned int> device_temporal_observed_counts_;
+    DeviceBuffer<unsigned int> device_temporal_reference_offsets_;
+    DeviceBuffer<unsigned int> device_temporal_reference_counts_;
+    DeviceBuffer<unsigned int> device_temporal_learned_counts_;
+    DeviceBuffer<unsigned long long> device_temporal_match_counts_;
+    DeviceBuffer<int> device_temporal_last_match_;
+    DeviceBuffer<unsigned long long> device_edge_code_window_start_;
+    DeviceBuffer<unsigned int> device_edge_code_observed_offsets_;
+    DeviceBuffer<unsigned int> device_edge_code_observed_counts_;
+    DeviceBuffer<unsigned int> device_edge_code_reference_offsets_;
+    DeviceBuffer<unsigned int> device_edge_code_reference_counts_;
+    DeviceBuffer<unsigned int> device_edge_code_learned_counts_;
+    DeviceBuffer<unsigned long long> device_edge_code_match_counts_;
+    DeviceBuffer<int> device_edge_code_last_match_;
+    DeviceBuffer<unsigned long long> device_metrics_;
+};
+
+CudaInferenceSession::CudaInferenceSession(const declarative::Connectome& connectome)
+    : impl_(std::make_unique<Impl>(connectome)) {}
+
+CudaInferenceSession::~CudaInferenceSession() = default;
+CudaInferenceSession::CudaInferenceSession(CudaInferenceSession&&) noexcept = default;
+CudaInferenceSession& CudaInferenceSession::operator=(CudaInferenceSession&&) noexcept = default;
+
+bool CudaInferenceSession::available() const noexcept {
+    return impl_ != nullptr && impl_->available();
+}
+
+CudaInferenceBatchResult CudaInferenceSession::run_batch(
+    const std::vector<CudaInferenceSample>& samples,
+    const CudaInferenceOptions& options) {
+    return impl_->run_batch(samples, options);
+}
+
+void CudaInferenceSession::reset_state() {
+    impl_->reset_state();
+}
 
 std::string_view CudaBackend::name() const noexcept {
     return "cuda";

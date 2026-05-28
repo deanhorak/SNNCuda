@@ -160,6 +160,63 @@ Prefer these headers in downstream projects:
 Avoid depending on files under `src/` or `tests/`; those are implementation and
 validation details.
 
+## Persistent CUDA Inference
+
+For dataset inference, prefer `backends::CudaInferenceSession` over calling
+`CudaBackend::run_resident_propagation` for every sample. The compatibility API
+still works, but it packs and uploads CUDA state for each call. A session uploads
+the immutable `Connectome` buffers once, then reuses device allocations for many
+samples.
+
+```cpp
+#include "snncuda/backends/CudaBackend.h"
+
+using namespace snncuda;
+
+declarative::Connectome connectome = /* build or load once */;
+backends::CudaInferenceSession session(connectome);
+
+backends::CudaInferenceOptions options;
+options.max_steps = 8;
+options.reset_state_between_samples = true; // stateless inference by default
+options.readout_neurons = class_neuron_ids;
+
+std::vector<backends::CudaInferenceSample> samples;
+samples.push_back({
+    .inputs = {
+        {.neuron = pixel_17},
+        {.neuron = pixel_311},
+    },
+});
+
+const auto result = session.run_batch(samples, options);
+for (const auto& sample : result.samples) {
+    // sample.readout_spike_counts is ordered like options.readout_neurons.
+}
+```
+
+`CudaInferenceSample` uses `CudaWeightedInput`:
+
+```cpp
+struct CudaWeightedInput {
+    core::NeuronId neuron;
+    float weight{1.0F};
+    std::uint32_t tick{0};
+};
+```
+
+The current CUDA session treats each input as an externally fired neuron at its
+requested tick. Use `weight = 1.0F` for active-neuron inference. The weight field
+is part of the public shape so weighted external current injection can be added
+without changing downstream call sites.
+
+Each `CudaInferenceSampleResult` returns per-sample readout spike counts,
+delivered spike count, fired spike count, and `CudaDebugMetrics`. `run_batch`
+also reports total batch elapsed time. Stateless inference resets mutable
+neuron/synapse/runtime buffers between samples. Set
+`reset_state_between_samples = false` to preserve neuron and synapse state while
+still clearing per-sample scheduler and metrics buffers.
+
 ## Python
 
 The `python/` package is a small `ctypes` wrapper around the C ABI. It currently

@@ -2,6 +2,7 @@
 #include "snncuda/declarative/Connectome.h"
 #include "snncuda/runtime/NetworkPropagator.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -235,6 +236,83 @@ void test_cuda_coded_synapse_expansion_matches_cpu() {
     require(gpu.final_synapse_code_match_counts[0] >= 1, "CUDA synapse should recognize repeated spike code");
 }
 
+void test_cuda_inference_session_matches_repeated_single_sample_cuda() {
+    const auto connectome = snncuda::declarative::ConnectomeBuilder{}.build(make_ltp_ir());
+    const auto input = connectome.populations.at("input").at(0);
+    const auto target = connectome.populations.at("target").at(0);
+
+    const snncuda::backends::CudaBackend cuda;
+    const auto first = cuda.run_resident_propagation(connectome, {input}, 1);
+    const auto second = cuda.run_resident_propagation(connectome, {input}, 1);
+
+    snncuda::backends::CudaInferenceSession session(connectome);
+    snncuda::backends::CudaInferenceOptions options;
+    options.max_steps = 1;
+    options.readout_neurons = {target};
+    const auto batch = session.run_batch(
+        {
+            {.inputs = {{.neuron = input}}},
+            {.inputs = {{.neuron = input}}},
+        },
+        options);
+
+    require(batch.executed, "CUDA inference session should execute");
+    require(batch.samples.size() == 2, "CUDA inference session should return each sample");
+    require(batch.samples[0].delivered_spikes == first.delivered_spikes, "batch delivered count should match single CUDA");
+    require(batch.samples[0].fired_spikes == first.fired_spikes, "batch fired count should match single CUDA");
+    require(batch.samples[0].readout_spike_counts.size() == 1, "batch should return requested readout");
+    require(
+        batch.samples[0].readout_spike_counts[0] == first.final_neuron_spike_counts[1],
+        "batch readout spike count should match single CUDA");
+    require(batch.samples[1].delivered_spikes == second.delivered_spikes, "second batch delivered count should match");
+    require(batch.samples[1].fired_spikes == second.fired_spikes, "second batch fired count should match");
+    require(
+        batch.samples[1].readout_spike_counts[0] == second.final_neuron_spike_counts[1],
+        "second batch readout spike count should match");
+}
+
+void test_cuda_inference_session_reuses_setup_for_many_samples() {
+    const auto connectome = snncuda::declarative::ConnectomeBuilder{}.build(make_ltp_ir());
+    const auto input = connectome.populations.at("input").at(0);
+    const auto target = connectome.populations.at("target").at(0);
+
+    std::vector<snncuda::backends::CudaInferenceSample> samples;
+    samples.reserve(100);
+    for (int i = 0; i < 100; ++i) {
+        samples.push_back({.inputs = {{.neuron = input}}});
+    }
+
+    const snncuda::backends::CudaBackend cuda;
+    const auto repeated_start = std::chrono::steady_clock::now();
+    for (const auto& sample : samples) {
+        std::vector<snncuda::core::NeuronId> active;
+        active.reserve(sample.inputs.size());
+        for (const auto& input_sample : sample.inputs) {
+            active.push_back(input_sample.neuron);
+        }
+        const auto result = cuda.run_resident_propagation(connectome, active, 1);
+        require(result.executed, "repeated CUDA inference should execute");
+    }
+    const auto repeated_end = std::chrono::steady_clock::now();
+    const auto repeated_seconds = std::chrono::duration<double>(repeated_end - repeated_start).count();
+
+    snncuda::backends::CudaInferenceSession session(connectome);
+    snncuda::backends::CudaInferenceOptions options;
+    options.max_steps = 1;
+    options.readout_neurons = {target};
+    const auto batch = session.run_batch(samples, options);
+
+    require(batch.executed, "persistent CUDA inference should execute");
+    require(batch.samples.size() == samples.size(), "persistent CUDA inference should return all samples");
+    require(batch.elapsed_seconds > 0.0, "persistent CUDA inference should report elapsed time");
+    require(
+        batch.elapsed_seconds < repeated_seconds,
+        "persistent CUDA inference should avoid repeated per-sample setup overhead");
+
+    std::cout << "CUDA repeated setup inference 100 samples: " << repeated_seconds
+              << "s, persistent batch: " << batch.elapsed_seconds << "s\n";
+}
+
 } // namespace
 
 int main() {
@@ -250,6 +328,8 @@ int main() {
         test_cuda_inhibitory_receptor_matches_cpu_nonfire();
         test_cuda_ltd_matches_cpu_direction();
         test_cuda_coded_synapse_expansion_matches_cpu();
+        test_cuda_inference_session_matches_repeated_single_sample_cuda();
+        test_cuda_inference_session_reuses_setup_for_many_samples();
     } catch (const std::exception& error) {
         std::cerr << "CUDA synapse/dendrite test failed: " << error.what() << '\n';
         return EXIT_FAILURE;

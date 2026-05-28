@@ -5,6 +5,7 @@
 #include "snncuda/declarative/Connectome.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -49,6 +50,58 @@ struct CudaPropagationResult {
     std::vector<std::uint32_t> final_temporal_learned_pattern_counts;
     std::vector<std::uint64_t> final_synapse_code_match_counts;
     std::vector<std::uint32_t> final_synapse_code_learned_pattern_counts;
+};
+
+struct CudaWeightedInput {
+    core::NeuronId neuron;
+    float weight{1.0F};
+    std::uint32_t tick{0};
+};
+
+struct CudaInferenceSample {
+    std::vector<CudaWeightedInput> inputs;
+};
+
+struct CudaInferenceOptions {
+    std::uint32_t max_steps{8};
+    bool reset_state_between_samples{true};
+    std::vector<core::NeuronId> readout_neurons;
+};
+
+struct CudaInferenceSampleResult {
+    std::vector<std::uint64_t> readout_spike_counts;
+    std::uint64_t delivered_spikes{0};
+    std::uint64_t fired_spikes{0};
+    CudaDebugMetrics debug;
+};
+
+struct CudaInferenceBatchResult {
+    bool executed{false};
+    double elapsed_seconds{0.0};
+    std::vector<CudaInferenceSampleResult> samples;
+};
+
+class CudaInferenceSession {
+public:
+    explicit CudaInferenceSession(const declarative::Connectome& connectome);
+    ~CudaInferenceSession();
+
+    CudaInferenceSession(const CudaInferenceSession&) = delete;
+    CudaInferenceSession& operator=(const CudaInferenceSession&) = delete;
+    CudaInferenceSession(CudaInferenceSession&&) noexcept;
+    CudaInferenceSession& operator=(CudaInferenceSession&&) noexcept;
+
+    [[nodiscard]] bool available() const noexcept;
+
+    [[nodiscard]] CudaInferenceBatchResult run_batch(
+        const std::vector<CudaInferenceSample>& samples,
+        const CudaInferenceOptions& options);
+
+    void reset_state();
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 class CudaBackend final : public Backend {
