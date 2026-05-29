@@ -253,11 +253,12 @@ void test_cuda_inference_session_matches_repeated_single_sample_cuda() {
         {
             {.inputs = {{.neuron = input}}},
             {.inputs = {{.neuron = input}}},
+            {.inputs = {}},
         },
         options);
 
     require(batch.executed, "CUDA inference session should execute");
-    require(batch.samples.size() == 2, "CUDA inference session should return each sample");
+    require(batch.samples.size() == 3, "CUDA inference session should return each sample");
     require(batch.samples[0].delivered_spikes == first.delivered_spikes, "batch delivered count should match single CUDA");
     require(batch.samples[0].fired_spikes == first.fired_spikes, "batch fired count should match single CUDA");
     require(batch.samples[0].readout_spike_counts.size() == 1, "batch should return requested readout");
@@ -269,6 +270,65 @@ void test_cuda_inference_session_matches_repeated_single_sample_cuda() {
     require(
         batch.samples[1].readout_spike_counts[0] == second.final_neuron_spike_counts[1],
         "second batch readout spike count should match");
+    require(batch.samples[2].delivered_spikes == 0, "empty batch sample should deliver no spikes");
+    require(batch.samples[2].fired_spikes == 0, "empty batch sample should fire no neurons");
+    require(batch.samples[2].readout_spike_counts[0] == 0, "empty batch sample should return zero readout spikes");
+}
+
+void test_cuda_inference_session_applies_weighted_external_inputs() {
+    const auto connectome = snncuda::declarative::ConnectomeBuilder{}.build(make_ltp_ir());
+    const auto input = connectome.populations.at("input").at(0);
+    const auto target = connectome.populations.at("target").at(0);
+
+    snncuda::backends::CudaInferenceSession session(connectome);
+    snncuda::backends::CudaInferenceOptions options;
+    options.max_steps = 1;
+    options.readout_neurons = {target};
+    const auto batch = session.run_batch(
+        {
+            {.inputs = {{.neuron = input, .weight = 0.5F}}},
+            {.inputs = {{.neuron = input, .weight = 1.0F}}},
+            {.inputs = {{.neuron = input, .weight = 0.4F}, {.neuron = input, .weight = 0.6F}}},
+        },
+        options);
+
+    require(batch.executed, "weighted CUDA inference session should execute");
+    require(batch.samples.size() == 3, "weighted CUDA inference session should return every sample");
+    require(batch.samples[0].delivered_spikes == 1, "subthreshold weighted input should be delivered");
+    require(batch.samples[0].fired_spikes == 0, "subthreshold weighted input should not fire");
+    require(batch.samples[0].readout_spike_counts[0] == 0, "subthreshold weighted input should not reach readout");
+    require(batch.samples[1].fired_spikes == 2, "threshold weighted input should fire input and readout");
+    require(batch.samples[1].readout_spike_counts[0] == 1, "threshold weighted input should fire readout");
+    require(batch.samples[2].fired_spikes == 2, "accumulated weighted inputs should fire input and readout");
+    require(batch.samples[2].readout_spike_counts[0] == 1, "accumulated weighted inputs should fire readout");
+}
+
+void test_cuda_feedforward_readout_accumulates_weighted_projection() {
+    const auto connectome = snncuda::declarative::ConnectomeBuilder{}.build(make_ltp_ir());
+    const auto input = connectome.populations.at("input").at(0);
+    const auto target = connectome.populations.at("target").at(0);
+
+    snncuda::backends::CudaInferenceSession session(connectome);
+    snncuda::backends::CudaInferenceOptions options;
+    options.readout_neurons = {target};
+    const auto batch = session.run_feedforward_batch(
+        {
+            {.inputs = {{.neuron = input, .weight = 0.5F}}},
+            {.inputs = {{.neuron = input, .weight = 1.0F}}},
+            {.inputs = {{.neuron = input, .weight = 0.25F}, {.neuron = input, .weight = 0.75F}}},
+        },
+        options);
+
+    require(batch.executed, "feedforward CUDA inference should execute");
+    require(batch.samples.size() == 3, "feedforward CUDA inference should return every sample");
+    require(batch.samples[0].readout_scores.size() == 1, "feedforward CUDA inference should return readout scores");
+    require(std::abs(batch.samples[0].readout_scores[0] - 0.25F) < 0.0001F, "feedforward score should scale input weight");
+    require(batch.samples[0].readout_spike_counts[0] == 0, "subthreshold feedforward score should not spike");
+    require(std::abs(batch.samples[1].readout_scores[0] - 0.5F) < 0.0001F, "feedforward score should use synapse weight");
+    require(batch.samples[1].readout_spike_counts[0] == 1, "threshold feedforward score should spike readout");
+    require(std::abs(batch.samples[2].readout_scores[0] - 0.5F) < 0.0001F, "feedforward inputs should accumulate");
+    require(batch.samples[2].readout_spike_counts[0] == 1, "accumulated feedforward score should spike readout");
+    require(batch.samples[2].delivered_spikes == 1, "merged feedforward input should count once per source neuron");
 }
 
 void test_cuda_inference_session_reuses_setup_for_many_samples() {
@@ -329,6 +389,8 @@ int main() {
         test_cuda_ltd_matches_cpu_direction();
         test_cuda_coded_synapse_expansion_matches_cpu();
         test_cuda_inference_session_matches_repeated_single_sample_cuda();
+        test_cuda_inference_session_applies_weighted_external_inputs();
+        test_cuda_feedforward_readout_accumulates_weighted_projection();
         test_cuda_inference_session_reuses_setup_for_many_samples();
     } catch (const std::exception& error) {
         std::cerr << "CUDA synapse/dendrite test failed: " << error.what() << '\n';

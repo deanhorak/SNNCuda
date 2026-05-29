@@ -48,7 +48,12 @@ Spike delivery uses a circular timing wheel rather than a heap. Each simulation 
 This is the default because fixed-timestep SNN simulations schedule large numbers of near-future spikes. A timing wheel gives O(1) amortized insertion and avoids heap churn in dense traffic. The implementation still stores absolute delivery ticks inside each bucket, so events farther in the future than one wheel rotation are retained until their real tick arrives.
 
 The CUDA path translates fired neurons and scheduled synapse events into compact
-device arrays. Future paging work should add:
+device arrays. `CudaInferenceSession` also provides a separate fixed-weight
+feedforward readout path for classifier-style networks where weighted inputs
+project directly to readout neurons. That path bypasses pixel-neuron firing,
+temporal/STDP machinery, dendritic state, and per-tick scheduler queues, and
+accumulates readout scores as `input_weight * synapse_weight` on the device.
+Future paging work should add:
 
 - group due spikes by target neuron or resident-state page
 - load cold neuron state through the LRU residency layer

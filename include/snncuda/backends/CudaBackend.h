@@ -70,6 +70,7 @@ struct CudaInferenceOptions {
 
 struct CudaInferenceSampleResult {
     std::vector<std::uint64_t> readout_spike_counts;
+    std::vector<float> readout_scores;
     std::uint64_t delivered_spikes{0};
     std::uint64_t fired_spikes{0};
     CudaDebugMetrics debug;
@@ -94,6 +95,10 @@ public:
     [[nodiscard]] bool available() const noexcept;
 
     [[nodiscard]] CudaInferenceBatchResult run_batch(
+        const std::vector<CudaInferenceSample>& samples,
+        const CudaInferenceOptions& options);
+
+    [[nodiscard]] CudaInferenceBatchResult run_feedforward_batch(
         const std::vector<CudaInferenceSample>& samples,
         const CudaInferenceOptions& options);
 

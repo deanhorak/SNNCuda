@@ -166,7 +166,8 @@ For dataset inference, prefer `backends::CudaInferenceSession` over calling
 `CudaBackend::run_resident_propagation` for every sample. The compatibility API
 still works, but it packs and uploads CUDA state for each call. A session uploads
 the immutable `Connectome` buffers once, then reuses device allocations for many
-samples.
+samples. Stateless batches execute with a device-side batch dimension, so
+samples are processed together instead of one host-driven CUDA run per sample.
 
 ```cpp
 #include "snncuda/backends/CudaBackend.h"
@@ -205,17 +206,49 @@ struct CudaWeightedInput {
 };
 ```
 
-The current CUDA session treats each input as an externally fired neuron at its
-requested tick. Use `weight = 1.0F` for active-neuron inference. The weight field
-is part of the public shape so weighted external current injection can be added
-without changing downstream call sites.
+The CUDA session applies each input as external soma current at its requested
+tick. Inputs with the same neuron and tick accumulate. The neuron is added to the
+fired queue only when the accumulated external input crosses that neuron's
+threshold. Use `weight = 1.0F` for active-neuron inference with input neurons
+whose threshold is `1.0F`.
 
 Each `CudaInferenceSampleResult` returns per-sample readout spike counts,
-delivered spike count, fired spike count, and `CudaDebugMetrics`. `run_batch`
-also reports total batch elapsed time. Stateless inference resets mutable
-neuron/synapse/runtime buffers between samples. Set
+readout scores when available, delivered spike count, fired spike count, and
+`CudaDebugMetrics`. `run_batch` also reports total batch elapsed time. Stateless
+inference resets mutable neuron/synapse/runtime buffers between samples. Set
 `reset_state_between_samples = false` to preserve neuron and synapse state while
-still clearing per-sample scheduler and metrics buffers.
+still clearing per-sample scheduler and metrics buffers. Stateful mode currently
+uses the sequential persistent-session path because preserving state creates an
+ordered dependency between samples.
+
+For fixed-weight feedforward classifiers, use `run_feedforward_batch` instead
+of the spiking path. It skips pixel-neuron simulation, temporal pattern state,
+STDP scans, dendritic decay, scheduler queues, and per-tick host synchronization.
+The CUDA kernel directly accumulates:
+
+```text
+readout_score[class] += input_weight[pixel] * synapse_weight[pixel -> class]
+```
+
+Results use `options.readout_neurons` order. `readout_scores` contains the raw
+class currents, and `readout_spike_counts` is thresholded against each readout
+neuron's configured threshold.
+
+```cpp
+backends::CudaInferenceOptions readout_options;
+readout_options.readout_neurons = class_neuron_ids;
+
+std::vector<backends::CudaInferenceSample> images;
+images.push_back({
+    .inputs = {
+        {.neuron = pixel_17, .weight = 0.42F},
+        {.neuron = pixel_311, .weight = 0.91F},
+    },
+});
+
+const auto scores = session.run_feedforward_batch(images, readout_options);
+const auto& class_scores = scores.samples.front().readout_scores;
+```
 
 ## Python
 
