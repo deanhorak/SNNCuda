@@ -1309,6 +1309,224 @@ __global__ void threshold_feedforward_readout_kernel(
     readout_spike_counts[global] = readout_scores[global] >= readout_thresholds[readout] ? 1ULL : 0ULL;
 }
 
+__global__ void initialize_recurrent_hidden_events_kernel(
+    int sample_count,
+    int input_capacity,
+    int hidden_count,
+    int time_count,
+    const int* input_neurons,
+    const float* input_weights,
+    const int* input_counts,
+    const int* dense_to_hidden,
+    float* hidden_events) {
+    const auto global = blockIdx.x * blockDim.x + threadIdx.x;
+    const auto total = sample_count * input_capacity;
+    if (global >= total) {
+        return;
+    }
+
+    const auto sample = global / input_capacity;
+    const auto slot = global % input_capacity;
+    if (slot >= input_counts[sample]) {
+        return;
+    }
+
+    const auto hidden = dense_to_hidden[input_neurons[sample * input_capacity + slot]];
+    if (hidden >= 0 && hidden < hidden_count) {
+        atomicAdd(
+            &hidden_events[(sample * time_count) * hidden_count + hidden],
+            input_weights[sample * input_capacity + slot]);
+    }
+}
+
+__global__ void propagate_hidden_events_to_readouts_kernel(
+    int sample_count,
+    int hidden_count,
+    int readout_count,
+    int time_count,
+    int step,
+    const float* hidden_events,
+    const int* hidden_dense_neurons,
+    const int* outgoing_offsets,
+    const int* outgoing_edges,
+    const int* edge_targets,
+    const unsigned int* edge_delays,
+    const float* edge_weights,
+    const int* dense_to_readout,
+    float* readout_events) {
+    const auto global = blockIdx.x * blockDim.x + threadIdx.x;
+    const auto total = sample_count * hidden_count;
+    if (global >= total) {
+        return;
+    }
+
+    const auto sample = global / hidden_count;
+    const auto hidden = global % hidden_count;
+    const auto hidden_score = hidden_events[(sample * time_count + step) * hidden_count + hidden];
+    if (hidden_score == 0.0F) {
+        return;
+    }
+
+    const auto source = hidden_dense_neurons[hidden];
+    for (auto edge_index = outgoing_offsets[source]; edge_index < outgoing_offsets[source + 1]; ++edge_index) {
+        const auto edge = outgoing_edges[edge_index];
+        const auto readout = dense_to_readout[edge_targets[edge]];
+        const auto delivery_step = step + static_cast<int>(edge_delays[edge]);
+        if (readout >= 0 && readout < readout_count && delivery_step < time_count) {
+            atomicAdd(
+                &readout_events[(sample * time_count + delivery_step) * readout_count + readout],
+                hidden_score * edge_weights[edge]);
+        }
+    }
+}
+
+__global__ void select_recurrent_readout_events_kernel(
+    int sample_count,
+    int readout_count,
+    int time_count,
+    int step,
+    int top_k,
+    int use_scores_not_spikes,
+    const float* readout_events,
+    const float* readout_thresholds,
+    float* readout_gates,
+    int* selected) {
+    const auto sample = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sample >= sample_count) {
+        return;
+    }
+
+    const auto event_base = (sample * time_count + step) * readout_count;
+    const auto gate_base = sample * readout_count;
+    if (top_k <= 0) {
+        for (int readout = 0; readout < readout_count; ++readout) {
+            const auto score = readout_events[event_base + readout];
+            if (score >= readout_thresholds[readout]) {
+                readout_gates[gate_base + readout] = use_scores_not_spikes != 0 ? score : 1.0F;
+                selected[gate_base + readout] = 1;
+            }
+        }
+        return;
+    }
+
+    const auto limit = min(top_k, readout_count);
+    for (int pass = 0; pass < limit; ++pass) {
+        auto best = -1;
+        auto best_score = -3.402823466e+38F;
+        for (int readout = 0; readout < readout_count; ++readout) {
+            const auto score = readout_events[event_base + readout];
+            if (selected[gate_base + readout] == 0 && score > best_score) {
+                best_score = score;
+                best = readout;
+            }
+        }
+        if (best >= 0) {
+            selected[gate_base + best] = 1;
+            readout_gates[gate_base + best] = use_scores_not_spikes != 0 ? best_score : 1.0F;
+        }
+    }
+}
+
+__global__ void propagate_readout_feedback_events_kernel(
+    int sample_count,
+    int readout_count,
+    int hidden_count,
+    int time_count,
+    int step,
+    float feedback_decay,
+    const float* readout_gates,
+    const int* readout_dense_neurons,
+    const int* outgoing_offsets,
+    const int* outgoing_edges,
+    const int* edge_targets,
+    const unsigned int* edge_delays,
+    const float* edge_weights,
+    const int* dense_to_hidden,
+    float* hidden_events) {
+    const auto global = blockIdx.x * blockDim.x + threadIdx.x;
+    const auto total = sample_count * readout_count;
+    if (global >= total) {
+        return;
+    }
+
+    const auto sample = global / readout_count;
+    const auto readout = global % readout_count;
+    const auto gate = readout_gates[sample * readout_count + readout];
+    if (gate == 0.0F) {
+        return;
+    }
+
+    const auto source = readout_dense_neurons[readout];
+    for (auto edge_index = outgoing_offsets[source]; edge_index < outgoing_offsets[source + 1]; ++edge_index) {
+        const auto edge = outgoing_edges[edge_index];
+        const auto hidden = dense_to_hidden[edge_targets[edge]];
+        const auto delivery_step = step + static_cast<int>(edge_delays[edge]);
+        if (hidden >= 0 && hidden < hidden_count && delivery_step < time_count) {
+            atomicAdd(
+                &hidden_events[(sample * time_count + delivery_step) * hidden_count + hidden],
+                feedback_decay * gate * edge_weights[edge]);
+        }
+    }
+}
+
+__global__ void apply_topk_hidden_events_kernel(
+    int sample_count,
+    int hidden_count,
+    int time_count,
+    int step,
+    int top_k,
+    float* hidden_events,
+    int* selected) {
+    const auto sample = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sample >= sample_count || top_k <= 0 || top_k >= hidden_count) {
+        return;
+    }
+
+    const auto base = (sample * time_count + step) * hidden_count;
+    const auto selected_base = sample * hidden_count;
+    const auto limit = min(top_k, hidden_count);
+    for (int pass = 0; pass < limit; ++pass) {
+        auto best = -1;
+        auto best_score = -3.402823466e+38F;
+        for (int hidden = 0; hidden < hidden_count; ++hidden) {
+            const auto score = hidden_events[base + hidden];
+            if (selected[selected_base + hidden] == 0 && score > best_score) {
+                best_score = score;
+                best = hidden;
+            }
+        }
+        if (best >= 0) {
+            selected[selected_base + best] = 1;
+        }
+    }
+    for (int hidden = 0; hidden < hidden_count; ++hidden) {
+        if (selected[selected_base + hidden] == 0) {
+            hidden_events[base + hidden] = 0.0F;
+        }
+    }
+}
+
+__global__ void sum_recurrent_readout_events_kernel(
+    int sample_count,
+    int readout_count,
+    int time_count,
+    const float* readout_events,
+    float* readout_scores) {
+    const auto global = blockIdx.x * blockDim.x + threadIdx.x;
+    const auto total = sample_count * readout_count;
+    if (global >= total) {
+        return;
+    }
+
+    const auto sample = global / readout_count;
+    const auto readout = global % readout_count;
+    float sum = 0.0F;
+    for (int step = 0; step < time_count; ++step) {
+        sum += readout_events[(sample * time_count + step) * readout_count + readout];
+    }
+    readout_scores[global] = sum;
+}
+
 } // namespace
 
 namespace snncuda::backends {
@@ -1630,6 +1848,257 @@ public:
         return batch;
     }
 
+    [[nodiscard]] CudaInferenceBatchResult run_recurrent_feedforward_batch(
+        const std::vector<CudaInferenceSample>& samples,
+        const CudaRecurrentFeedforwardOptions& options) {
+        if (!available_) {
+            return {};
+        }
+        CudaInferenceBatchResult batch;
+        batch.executed = true;
+        batch.samples.resize(samples.size());
+        if (samples.empty() || options.readout_neurons.empty()) {
+            return batch;
+        }
+
+        if (options.use_full_spike_timing) {
+            CudaInferenceOptions timing_options;
+            timing_options.max_steps = options.max_timing_steps == 0
+                ? static_cast<std::uint32_t>(
+                    static_cast<std::size_t>(max_edge_delay_ticks_)
+                        * (1U + 2U * static_cast<std::size_t>(options.iterations))
+                    + 1U)
+                : options.max_timing_steps;
+            timing_options.reset_state_between_samples = true;
+            timing_options.readout_neurons = options.readout_neurons;
+            return run_batch(samples, timing_options);
+        }
+
+        const auto start = std::chrono::steady_clock::now();
+        const auto sample_count = samples.size();
+        const auto readout_count = options.readout_neurons.size();
+        const auto hidden_neurons = resolved_hidden_neurons(options);
+        const auto hidden_count = hidden_neurons.size();
+        if (hidden_count == 0) {
+            return batch;
+        }
+        const auto input_capacity = max_sample_input_count(samples);
+        const auto time_count = static_cast<std::size_t>(max_edge_delay_ticks_)
+            * (1U + 2U * static_cast<std::size_t>(options.iterations))
+            + 1U;
+        ensure_recurrent_capacity(sample_count, input_capacity, hidden_count, readout_count, time_count);
+
+        std::vector<int> dense_to_hidden(neuron_count_, -1);
+        std::vector<int> hidden_dense_neurons(hidden_count, 0);
+        for (std::size_t hidden = 0; hidden < hidden_count; ++hidden) {
+            const auto found = dense_index_.find(hidden_neurons[hidden]);
+            if (found == dense_index_.end()) {
+                continue;
+            }
+            dense_to_hidden[static_cast<std::size_t>(found->second)] = static_cast<int>(hidden);
+            hidden_dense_neurons[hidden] = found->second;
+        }
+
+        std::vector<int> dense_to_readout(neuron_count_, -1);
+        std::vector<int> readout_dense_neurons(readout_count, 0);
+        std::vector<float> readout_thresholds(readout_count, 1.0F);
+        for (std::size_t readout = 0; readout < readout_count; ++readout) {
+            const auto found = dense_index_.find(options.readout_neurons[readout]);
+            if (found == dense_index_.end()) {
+                continue;
+            }
+            dense_to_readout[static_cast<std::size_t>(found->second)] = static_cast<int>(readout);
+            readout_dense_neurons[readout] = found->second;
+            readout_thresholds[readout] = thresholds_[static_cast<std::size_t>(found->second)];
+        }
+
+        std::vector<int> input_counts(sample_count, 0);
+        std::vector<int> input_neurons(sample_count * recurrent_input_capacity_, 0);
+        std::vector<float> input_weights(sample_count * recurrent_input_capacity_, 0.0F);
+        for (std::size_t sample_index = 0; sample_index < samples.size(); ++sample_index) {
+            std::unordered_map<int, float> merged_inputs;
+            merged_inputs.reserve(samples[sample_index].inputs.size());
+            for (const auto& input : samples[sample_index].inputs) {
+                const auto found = dense_index_.find(input.neuron);
+                if (found != dense_index_.end()) {
+                    merged_inputs[found->second] += input.weight;
+                }
+            }
+            for (const auto& [neuron, weight] : merged_inputs) {
+                const auto slot = input_counts[sample_index]++;
+                if (slot < static_cast<int>(recurrent_input_capacity_)) {
+                    const auto offset = sample_index * recurrent_input_capacity_ + static_cast<std::size_t>(slot);
+                    input_neurons[offset] = neuron;
+                    input_weights[offset] = weight;
+                }
+            }
+            batch.samples[sample_index].delivered_spikes = static_cast<std::uint64_t>(merged_inputs.size());
+        }
+
+        recurrent_dense_to_hidden_.copy_from_host(dense_to_hidden.data(), dense_to_hidden.size());
+        recurrent_hidden_dense_neurons_.copy_from_host(hidden_dense_neurons.data(), hidden_dense_neurons.size());
+        recurrent_dense_to_readout_.copy_from_host(dense_to_readout.data(), dense_to_readout.size());
+        recurrent_readout_dense_neurons_.copy_from_host(readout_dense_neurons.data(), readout_dense_neurons.size());
+        recurrent_readout_thresholds_.copy_from_host(readout_thresholds.data(), readout_thresholds.size());
+        recurrent_input_counts_.copy_from_host(input_counts.data(), input_counts.size());
+        recurrent_input_neurons_.copy_from_host(input_neurons.data(), input_neurons.size());
+        recurrent_input_weights_.copy_from_host(input_weights.data(), input_weights.size());
+        recurrent_hidden_events_.zero();
+        recurrent_readout_events_.zero();
+        recurrent_readout_scores_.zero();
+        recurrent_readout_gates_.zero();
+        recurrent_readout_spike_counts_.zero();
+
+        const auto threads = 256;
+        const auto input_total = sample_count * recurrent_input_capacity_;
+        if (input_total > 0) {
+            const auto blocks = static_cast<int>((input_total + threads - 1) / threads);
+            initialize_recurrent_hidden_events_kernel<<<blocks, threads>>>(
+                static_cast<int>(sample_count),
+                static_cast<int>(recurrent_input_capacity_),
+                static_cast<int>(hidden_count),
+                static_cast<int>(time_count),
+                recurrent_input_neurons_.get(),
+                recurrent_input_weights_.get(),
+                recurrent_input_counts_.get(),
+                recurrent_dense_to_hidden_.get(),
+                recurrent_hidden_events_.get());
+            check_cuda(cudaGetLastError(), "initialize_recurrent_hidden_events_kernel launch");
+        }
+
+        for (std::uint32_t step = 0; step < time_count; ++step) {
+            recurrent_readout_gates_.zero();
+            recurrent_readout_selected_.zero();
+            recurrent_hidden_selected_.zero();
+
+            if (options.top_k_hidden > 0) {
+                apply_topk_hidden_events_kernel<<<
+                    static_cast<int>((sample_count + threads - 1) / threads),
+                    threads>>>(
+                    static_cast<int>(sample_count),
+                    static_cast<int>(hidden_count),
+                    static_cast<int>(time_count),
+                    static_cast<int>(step),
+                    static_cast<int>(options.top_k_hidden),
+                    recurrent_hidden_events_.get(),
+                    recurrent_hidden_selected_.get());
+                check_cuda(cudaGetLastError(), "apply_topk_hidden_events_kernel launch");
+            }
+
+            propagate_hidden_events_to_readouts_kernel<<<
+                static_cast<int>((sample_count * hidden_count + threads - 1) / threads),
+                threads>>>(
+                static_cast<int>(sample_count),
+                static_cast<int>(hidden_count),
+                static_cast<int>(readout_count),
+                static_cast<int>(time_count),
+                static_cast<int>(step),
+                recurrent_hidden_events_.get(),
+                recurrent_hidden_dense_neurons_.get(),
+                device_offsets_.get(),
+                device_outgoing_edges_.get(),
+                device_targets_.get(),
+                device_delays_.get(),
+                device_initial_weights_.get(),
+                recurrent_dense_to_readout_.get(),
+                recurrent_readout_events_.get());
+            check_cuda(cudaGetLastError(), "propagate_hidden_events_to_readouts_kernel launch");
+
+            select_recurrent_readout_events_kernel<<<
+                static_cast<int>((sample_count + threads - 1) / threads),
+                threads>>>(
+                static_cast<int>(sample_count),
+                static_cast<int>(readout_count),
+                static_cast<int>(time_count),
+                static_cast<int>(step),
+                static_cast<int>(options.top_k_feedback_readouts),
+                options.use_scores_not_spikes ? 1 : 0,
+                recurrent_readout_events_.get(),
+                recurrent_readout_thresholds_.get(),
+                recurrent_readout_gates_.get(),
+                recurrent_readout_selected_.get());
+            check_cuda(cudaGetLastError(), "select_recurrent_readout_events_kernel launch");
+
+            propagate_readout_feedback_events_kernel<<<
+                static_cast<int>((sample_count * readout_count + threads - 1) / threads),
+                threads>>>(
+                static_cast<int>(sample_count),
+                static_cast<int>(readout_count),
+                static_cast<int>(hidden_count),
+                static_cast<int>(time_count),
+                static_cast<int>(step),
+                options.feedback_decay,
+                recurrent_readout_gates_.get(),
+                recurrent_readout_dense_neurons_.get(),
+                device_offsets_.get(),
+                device_outgoing_edges_.get(),
+                device_targets_.get(),
+                device_delays_.get(),
+                device_initial_weights_.get(),
+                recurrent_dense_to_hidden_.get(),
+                recurrent_hidden_events_.get());
+            check_cuda(cudaGetLastError(), "propagate_readout_feedback_events_kernel launch");
+        }
+
+        sum_recurrent_readout_events_kernel<<<
+            static_cast<int>((sample_count * readout_count + threads - 1) / threads),
+            threads>>>(
+            static_cast<int>(sample_count),
+            static_cast<int>(readout_count),
+            static_cast<int>(time_count),
+            recurrent_readout_events_.get(),
+            recurrent_readout_scores_.get());
+        check_cuda(cudaGetLastError(), "sum_recurrent_readout_events_kernel launch");
+
+        threshold_feedforward_readout_kernel<<<
+            static_cast<int>((sample_count * readout_count + threads - 1) / threads),
+            threads>>>(
+            static_cast<int>(sample_count),
+            static_cast<int>(readout_count),
+            recurrent_readout_scores_.get(),
+            recurrent_readout_thresholds_.get(),
+            recurrent_readout_spike_counts_.get());
+        check_cuda(cudaGetLastError(), "threshold recurrent readout launch");
+        check_cuda(cudaDeviceSynchronize(), "recurrent feedforward synchronize");
+
+        const auto readout_total = sample_count * readout_count;
+        std::vector<float> scores(readout_total, 0.0F);
+        std::vector<unsigned long long> spike_counts(readout_total, 0);
+        check_cuda(
+            cudaMemcpy(
+                scores.data(),
+                recurrent_readout_scores_.get(),
+                scores.size() * sizeof(float),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy recurrent readout scores");
+        check_cuda(
+            cudaMemcpy(
+                spike_counts.data(),
+                recurrent_readout_spike_counts_.get(),
+                spike_counts.size() * sizeof(unsigned long long),
+                cudaMemcpyDeviceToHost),
+            "cudaMemcpy recurrent readout spike counts");
+
+        for (std::size_t sample_index = 0; sample_index < samples.size(); ++sample_index) {
+            auto& sample_result = batch.samples[sample_index];
+            sample_result.readout_scores.reserve(readout_count);
+            sample_result.readout_spike_counts.reserve(readout_count);
+            for (std::size_t readout = 0; readout < readout_count; ++readout) {
+                const auto offset = sample_index * readout_count + readout;
+                sample_result.readout_scores.push_back(scores[offset]);
+                sample_result.readout_spike_counts.push_back(static_cast<std::uint64_t>(spike_counts[offset]));
+                sample_result.fired_spikes += static_cast<std::uint64_t>(spike_counts[offset]);
+            }
+            sample_result.debug.ticks_processed = time_count;
+            sample_result.debug.processed_events = sample_result.delivered_spikes;
+            sample_result.debug.dendritic_integrations = sample_result.delivered_spikes;
+        }
+
+        const auto end = std::chrono::steady_clock::now();
+        batch.elapsed_seconds = std::chrono::duration<double>(end - start).count();
+        return batch;
+    }
+
 private:
     static bool cuda_available() noexcept {
         int device_count = 0;
@@ -1675,6 +2144,7 @@ private:
             const auto edge = static_cast<int>(edge_targets_.size());
             edge_targets_.push_back(target->second);
             edge_delays_.push_back(std::max(1U, synapse.delay_ticks));
+            max_edge_delay_ticks_ = std::max(max_edge_delay_ticks_, std::max(1U, synapse.delay_ticks));
             const auto code_count = static_cast<unsigned int>(
                 std::min<std::size_t>(
                     synapse.spike_code_offsets.empty() ? 1 : synapse.spike_code_offsets.size(),
@@ -1762,6 +2232,65 @@ private:
         feedforward_scores_.allocate(sample_count * readout_count);
         feedforward_spike_counts_.allocate(sample_count * readout_count);
         feedforward_allocated_ = true;
+    }
+
+    std::vector<core::NeuronId> resolved_hidden_neurons(const CudaRecurrentFeedforwardOptions& options) const {
+        if (!options.hidden_neurons.empty()) {
+            return options.hidden_neurons;
+        }
+
+        std::unordered_set<core::NeuronId> readouts(options.readout_neurons.begin(), options.readout_neurons.end());
+        std::vector<core::NeuronId> hidden;
+        hidden.reserve(dense_index_.size());
+        for (const auto& [id, dense] : dense_index_) {
+            (void)dense;
+            if (readouts.find(id) == readouts.end()) {
+                hidden.push_back(id);
+            }
+        }
+        return hidden;
+    }
+
+    void ensure_recurrent_capacity(
+        std::size_t sample_count,
+        std::size_t input_capacity,
+        std::size_t hidden_count,
+        std::size_t readout_count,
+        std::size_t time_count) {
+        input_capacity = std::max<std::size_t>(1, input_capacity);
+        hidden_count = std::max<std::size_t>(1, hidden_count);
+        readout_count = std::max<std::size_t>(1, readout_count);
+        time_count = std::max<std::size_t>(1, time_count);
+        if (recurrent_allocated_
+            && recurrent_sample_count_ >= sample_count
+            && recurrent_input_capacity_ >= input_capacity
+            && recurrent_hidden_count_ >= hidden_count
+            && recurrent_readout_count_ >= readout_count
+            && recurrent_time_count_ >= time_count) {
+            return;
+        }
+
+        recurrent_sample_count_ = sample_count;
+        recurrent_input_capacity_ = input_capacity;
+        recurrent_hidden_count_ = hidden_count;
+        recurrent_readout_count_ = readout_count;
+        recurrent_time_count_ = time_count;
+        recurrent_input_neurons_.allocate(sample_count * input_capacity);
+        recurrent_input_weights_.allocate(sample_count * input_capacity);
+        recurrent_input_counts_.allocate(sample_count);
+        recurrent_dense_to_hidden_.allocate(neuron_count_);
+        recurrent_hidden_dense_neurons_.allocate(hidden_count);
+        recurrent_dense_to_readout_.allocate(neuron_count_);
+        recurrent_readout_dense_neurons_.allocate(readout_count);
+        recurrent_readout_thresholds_.allocate(readout_count);
+        recurrent_hidden_events_.allocate(sample_count * time_count * hidden_count);
+        recurrent_readout_events_.allocate(sample_count * time_count * readout_count);
+        recurrent_hidden_selected_.allocate(sample_count * hidden_count);
+        recurrent_readout_scores_.allocate(sample_count * readout_count);
+        recurrent_readout_gates_.allocate(sample_count * readout_count);
+        recurrent_readout_selected_.allocate(sample_count * readout_count);
+        recurrent_readout_spike_counts_.allocate(sample_count * readout_count);
+        recurrent_allocated_ = true;
     }
 
     [[nodiscard]] CudaInferenceBatchResult run_stateless_device_batch(
@@ -2602,6 +3131,7 @@ private:
     bool mutable_state_initialized_{false};
     bool batched_allocated_{false};
     bool feedforward_allocated_{false};
+    bool recurrent_allocated_{false};
     std::size_t neuron_count_{0};
     std::size_t allocated_tick_count_{0};
     std::size_t allocated_event_capacity_{0};
@@ -2614,6 +3144,12 @@ private:
     std::size_t feedforward_sample_count_{0};
     std::size_t feedforward_input_capacity_{0};
     std::size_t feedforward_readout_count_{0};
+    std::size_t recurrent_sample_count_{0};
+    std::size_t recurrent_input_capacity_{0};
+    std::size_t recurrent_hidden_count_{0};
+    std::size_t recurrent_readout_count_{0};
+    std::size_t recurrent_time_count_{0};
+    unsigned int max_edge_delay_ticks_{1};
 
     std::unordered_map<core::NeuronId, int> dense_index_;
     std::vector<float> thresholds_;
@@ -2760,6 +3296,22 @@ private:
     DeviceBuffer<float> feedforward_readout_thresholds_;
     DeviceBuffer<float> feedforward_scores_;
     DeviceBuffer<unsigned long long> feedforward_spike_counts_;
+
+    DeviceBuffer<int> recurrent_input_neurons_;
+    DeviceBuffer<float> recurrent_input_weights_;
+    DeviceBuffer<int> recurrent_input_counts_;
+    DeviceBuffer<int> recurrent_dense_to_hidden_;
+    DeviceBuffer<int> recurrent_hidden_dense_neurons_;
+    DeviceBuffer<int> recurrent_dense_to_readout_;
+    DeviceBuffer<int> recurrent_readout_dense_neurons_;
+    DeviceBuffer<float> recurrent_readout_thresholds_;
+    DeviceBuffer<float> recurrent_hidden_events_;
+    DeviceBuffer<float> recurrent_readout_events_;
+    DeviceBuffer<int> recurrent_hidden_selected_;
+    DeviceBuffer<float> recurrent_readout_scores_;
+    DeviceBuffer<float> recurrent_readout_gates_;
+    DeviceBuffer<int> recurrent_readout_selected_;
+    DeviceBuffer<unsigned long long> recurrent_readout_spike_counts_;
 };
 
 CudaInferenceSession::CudaInferenceSession(const declarative::Connectome& connectome)
@@ -2783,6 +3335,12 @@ CudaInferenceBatchResult CudaInferenceSession::run_feedforward_batch(
     const std::vector<CudaInferenceSample>& samples,
     const CudaInferenceOptions& options) {
     return impl_->run_feedforward_batch(samples, options);
+}
+
+CudaInferenceBatchResult CudaInferenceSession::run_recurrent_feedforward_batch(
+    const std::vector<CudaInferenceSample>& samples,
+    const CudaRecurrentFeedforwardOptions& options) {
+    return impl_->run_recurrent_feedforward_batch(samples, options);
 }
 
 void CudaInferenceSession::reset_state() {

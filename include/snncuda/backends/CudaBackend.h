@@ -68,6 +68,18 @@ struct CudaInferenceOptions {
     std::vector<core::NeuronId> readout_neurons;
 };
 
+struct CudaRecurrentFeedforwardOptions {
+    std::uint32_t iterations{1};
+    std::vector<core::NeuronId> readout_neurons;
+    std::vector<core::NeuronId> hidden_neurons;
+    float feedback_decay{0.5F};
+    std::uint32_t top_k_feedback_readouts{1};
+    std::uint32_t top_k_hidden{0};
+    bool use_scores_not_spikes{true};
+    bool use_full_spike_timing{false};
+    std::uint32_t max_timing_steps{0};
+};
+
 struct CudaInferenceSampleResult {
     std::vector<std::uint64_t> readout_spike_counts;
     std::vector<float> readout_scores;
@@ -101,6 +113,10 @@ public:
     [[nodiscard]] CudaInferenceBatchResult run_feedforward_batch(
         const std::vector<CudaInferenceSample>& samples,
         const CudaInferenceOptions& options);
+
+    [[nodiscard]] CudaInferenceBatchResult run_recurrent_feedforward_batch(
+        const std::vector<CudaInferenceSample>& samples,
+        const CudaRecurrentFeedforwardOptions& options);
 
     void reset_state();
 

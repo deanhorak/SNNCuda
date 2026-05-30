@@ -331,6 +331,93 @@ void test_cuda_feedforward_readout_accumulates_weighted_projection() {
     require(batch.samples[2].delivered_spikes == 1, "merged feedforward input should count once per source neuron");
 }
 
+void test_cuda_recurrent_feedforward_applies_readout_feedback() {
+    auto ir = make_ltp_ir();
+    ir.projections.push_back({
+        .name = "target_to_input_feedback",
+        .source = "target",
+        .target = "input",
+        .pattern = "one_to_one",
+        .weight = 1.0F,
+        .max_weight = 1.0F,
+        .delay_ticks = 1,
+        .plasticity_enabled = false,
+    });
+    const auto connectome = snncuda::declarative::ConnectomeBuilder{}.build(ir);
+    const auto input = connectome.populations.at("input").at(0);
+    const auto target = connectome.populations.at("target").at(0);
+
+    snncuda::backends::CudaInferenceSession session(connectome);
+    snncuda::backends::CudaRecurrentFeedforwardOptions options;
+    options.iterations = 1;
+    options.readout_neurons = {target};
+    options.hidden_neurons = {input};
+    options.feedback_decay = 1.0F;
+    options.top_k_feedback_readouts = 1;
+    options.use_scores_not_spikes = true;
+    auto direct_options = options;
+    direct_options.iterations = 0;
+    const auto direct = session.run_recurrent_feedforward_batch(
+        {{.inputs = {{.neuron = input, .weight = 1.0F}}}},
+        direct_options);
+    require(direct.executed, "direct delayed recurrent feedforward CUDA inference should execute");
+    require(
+        std::abs(direct.samples[0].readout_scores[0] - 0.5F) < 0.0001F,
+        "zero recurrent iterations should include delayed input-to-readout score only");
+
+    const auto batch = session.run_recurrent_feedforward_batch(
+        {{.inputs = {{.neuron = input, .weight = 1.0F}}}},
+        options);
+
+    require(batch.executed, "recurrent feedforward CUDA inference should execute");
+    require(batch.samples.size() == 1, "recurrent feedforward CUDA inference should return sample");
+    require(batch.samples[0].readout_scores.size() == 1, "recurrent feedforward should return readout score");
+    require(
+        std::abs(batch.samples[0].readout_scores[0] - 0.75F) < 0.0001F,
+        "recurrent feedback should update hidden score before final readout score");
+    require(batch.samples[0].readout_spike_counts[0] == 1, "recurrent feedforward score should threshold readout");
+}
+
+void test_cuda_recurrent_feedforward_full_spike_timing_uses_scheduler() {
+    auto ir = make_ltp_ir();
+    ir.projections.push_back({
+        .name = "target_to_input_feedback",
+        .source = "target",
+        .target = "input",
+        .pattern = "one_to_one",
+        .weight = 1.0F,
+        .max_weight = 1.0F,
+        .delay_ticks = 1,
+        .plasticity_enabled = false,
+    });
+    const auto connectome = snncuda::declarative::ConnectomeBuilder{}.build(ir);
+    const auto input = connectome.populations.at("input").at(0);
+    const auto target = connectome.populations.at("target").at(0);
+
+    snncuda::backends::CudaInferenceSession session(connectome);
+    snncuda::backends::CudaRecurrentFeedforwardOptions options;
+    options.iterations = 1;
+    options.readout_neurons = {target};
+    options.hidden_neurons = {input};
+    options.use_full_spike_timing = true;
+    options.max_timing_steps = 2;
+
+    const auto batch = session.run_recurrent_feedforward_batch(
+        {{.inputs = {{.neuron = input, .weight = 1.0F}}}},
+        options);
+
+    require(batch.executed, "full spike timing recurrent CUDA inference should execute");
+    require(batch.samples.size() == 1, "full spike timing recurrent CUDA inference should return sample");
+    require(batch.samples[0].readout_scores.empty(), "full spike timing should report spikes, not projected scores");
+    require(batch.samples[0].readout_spike_counts.size() == 1, "full spike timing should return readout spike count");
+    require(
+        batch.samples[0].readout_spike_counts[0] == 1,
+        "full spike timing should deliver delayed input-to-readout spike through scheduler");
+    require(batch.samples[0].debug.ticks_processed == 3, "full spike timing should run explicit ticks");
+    require(batch.samples[0].debug.scheduled_events >= 2, "full spike timing should schedule recurrent delayed events");
+    require(batch.samples[0].debug.dendritic_integrations >= 2, "full spike timing should integrate delayed synapses");
+}
+
 void test_cuda_inference_session_reuses_setup_for_many_samples() {
     const auto connectome = snncuda::declarative::ConnectomeBuilder{}.build(make_ltp_ir());
     const auto input = connectome.populations.at("input").at(0);
@@ -391,6 +478,8 @@ int main() {
         test_cuda_inference_session_matches_repeated_single_sample_cuda();
         test_cuda_inference_session_applies_weighted_external_inputs();
         test_cuda_feedforward_readout_accumulates_weighted_projection();
+        test_cuda_recurrent_feedforward_applies_readout_feedback();
+        test_cuda_recurrent_feedforward_full_spike_timing_uses_scheduler();
         test_cuda_inference_session_reuses_setup_for_many_samples();
     } catch (const std::exception& error) {
         std::cerr << "CUDA synapse/dendrite test failed: " << error.what() << '\n';

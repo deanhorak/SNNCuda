@@ -52,7 +52,15 @@ device arrays. `CudaInferenceSession` also provides a separate fixed-weight
 feedforward readout path for classifier-style networks where weighted inputs
 project directly to readout neurons. That path bypasses pixel-neuron firing,
 temporal/STDP machinery, dendritic state, and per-tick scheduler queues, and
-accumulates readout scores as `input_weight * synapse_weight` on the device.
+accumulates readout scores as `input_weight * synapse_weight` on the device. A
+recurrent feedforward variant repeats this direct projection with readout
+top-k/threshold gating and readout-to-feature feedback on a compact recurrent
+event timeline that honors per-projection `delay_ticks`, still avoiding the full
+spiking scheduler. When `CudaRecurrentFeedforwardOptions::use_full_spike_timing`
+is enabled, the same public API switches to the resident CUDA spiking scheduler:
+weighted inputs are injected on explicit ticks, projection delays schedule real
+synaptic events, and readout results are gathered from timed spikes instead of
+direct projection scores.
 Future paging work should add:
 
 - group due spikes by target neuron or resident-state page

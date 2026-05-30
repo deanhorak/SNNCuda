@@ -250,6 +250,59 @@ const auto scores = session.run_feedforward_batch(images, readout_options);
 const auto& class_scores = scores.samples.front().readout_scores;
 ```
 
+Use `run_recurrent_feedforward_batch` when a fixed-weight classifier also has
+readout-to-feature feedback edges and you want a small number of recurrent
+settling iterations without entering the full spike scheduler:
+
+```cpp
+backends::CudaRecurrentFeedforwardOptions recurrent_options;
+recurrent_options.iterations = 2;
+recurrent_options.hidden_neurons = pixel_neuron_ids;
+recurrent_options.readout_neurons = class_neuron_ids;
+recurrent_options.feedback_decay = 0.5F;
+recurrent_options.top_k_feedback_readouts = 3;
+recurrent_options.top_k_hidden = 128;
+recurrent_options.use_scores_not_spikes = true;
+
+const auto settled = session.run_recurrent_feedforward_batch(images, recurrent_options);
+```
+
+The recurrent feedforward path starts from weighted input features at recurrent
+step zero, scores readouts through fixed synapse weights, selects readouts by
+top-k or threshold, propagates selected readout feedback to hidden neurons,
+optionally keeps only the top-k hidden features, and re-scores readouts. Unlike
+the single-pass feedforward path, recurrent feedforward explicitly honors each
+projection's `delay_ticks`: a hidden-to-readout or readout-to-hidden contribution
+is delivered at `current_step + delay_ticks`. `iterations` controls the number
+of feedback rounds after the initial delayed readout pass. Final
+`readout_scores` are accumulated over the delayed readout event timeline and
+then thresholded into `readout_spike_counts`. Feedback uses scores when
+`use_scores_not_spikes` is true, otherwise selected readouts contribute a binary
+`1.0F` gate.
+
+For latency-sensitive models, STDP experiments, or temporal coding, enable the
+full spike-timing path:
+
+```cpp
+backends::CudaRecurrentFeedforwardOptions timing_options;
+timing_options.iterations = 2;
+timing_options.readout_neurons = class_neuron_ids;
+timing_options.use_full_spike_timing = true;
+timing_options.max_timing_steps = 32;
+
+const auto timed = session.run_recurrent_feedforward_batch(images, timing_options);
+```
+
+With `use_full_spike_timing` enabled, `run_recurrent_feedforward_batch` delegates
+to the resident CUDA spiking scheduler instead of the compact recurrent score
+timeline. Weighted external inputs are applied at their requested ticks, neuron
+thresholds determine spikes, synapse events are delivered by `delay_ticks`, and
+the normal dendritic, temporal, and plasticity accounting paths run. Results are
+reported as readout spike counts plus `CudaDebugMetrics`; `readout_scores` are
+left empty because this mode is a timed spike simulation rather than direct
+projection scoring. If `max_timing_steps` is zero, the session derives a timing
+window from `iterations` and the largest projection delay.
+
 ## Python
 
 The `python/` package is a small `ctypes` wrapper around the C ABI. It currently
